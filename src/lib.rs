@@ -200,10 +200,7 @@ pub fn actor_fn<F, T, U>(f: F) -> ActorFn<F, T>
 impl Builder {
     /// Returns a new actor `Builder` with default settings
     pub fn new() -> Builder {
-        Builder {
-            inbox: 1024,
-            in_flight: 16,
-        }
+        Default::default()
     }
 
     /// Sets the actor's inbox queue capacity.
@@ -255,6 +252,15 @@ impl Builder {
         let rx = ActorCell::new(actor, rx, self.in_flight);
 
         (tx, rx)
+    }
+}
+
+impl Default for Builder {
+    fn default() -> Builder {
+        Builder {
+            inbox: 1024,
+            in_flight: 16,
+        }
     }
 }
 
