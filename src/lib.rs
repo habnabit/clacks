@@ -26,6 +26,8 @@
 extern crate futures;
 extern crate futures_spawn;
 extern crate futures_mpsc;
+#[macro_use]
+extern crate scoped_tls;
 extern crate tokio_core;
 
 use futures::{Future, Stream, IntoFuture, Async, AsyncSink, Sink, Poll};
@@ -39,13 +41,13 @@ use std::marker::PhantomData;
 /// A value that manages state and responds to messages
 pub trait Actor {
     /// The message sent to the actor
-    type Request;
+    type Request: 'static;
 
     /// The response sent back from the actor
-    type Response;
+    type Response: 'static;
 
     /// The response error
-    type Error;
+    type Error: 'static;
 
     /// The internal response future. This will remain on the actor's task and
     /// will be polled to completion before being sent back to the caller.
@@ -124,12 +126,13 @@ pub struct Builder {
 /// Manages the runtime state of an `Actor`.
 pub struct ActorCell<A: Actor> {
     // The actor value
-    actor: A,
+    _actor: A,
 
     // Current state of the actor
     state: ActorStatePriv,
 
     // The actors inbox
+    tx: mpsc::Sender<Envelope<A::Request, A::Response, A::Error>>,
     rx: mpsc::Receiver<Envelope<A::Request, A::Response, A::Error>>,
 
     // A slab of futures that are being executed. Each slot in this vector is
@@ -191,6 +194,8 @@ pub fn actor_fn<F, T, U>(f: F) -> ActorFn<F, T>
     }
 }
 
+scoped_thread_local!(static CURRENT_ACTOR_REF: *const ::std::any::Any);
+
 /*
  *
  * ===== impl Builder =====
@@ -232,7 +237,7 @@ impl Builder {
     }
 
     /// Spawn the given closure as an actor
-    pub fn spawn_fn<F, T, U, S>(self, s: &S, f: F)
+    pub fn spawn_fn<F, T: 'static, U: 'static, S>(self, s: &S, f: F)
         -> ActorRef<T, U::Item, U::Error>
         where F: FnMut(T) -> U,
               U: IntoFuture,
@@ -248,8 +253,8 @@ impl Builder {
         // TODO: respect inbox bound
         let (tx, rx) = mpsc::channel(self.inbox);
 
+        let rx = ActorCell::new(actor, tx.clone(), rx, self.in_flight);
         let tx = ActorRef { tx: tx };
-        let rx = ActorCell::new(actor, rx, self.in_flight);
 
         (tx, rx)
     }
@@ -270,7 +275,7 @@ impl Default for Builder {
  *
  */
 
-impl<F, T, U> Actor for ActorFn<F, T>
+impl<F, T: 'static, U: 'static> Actor for ActorFn<F, T>
     where F: FnMut(T) -> U,
           U: IntoFuture,
 {
@@ -326,6 +331,22 @@ impl<T, U, E> ActorRef<T, U, E>
     }
 }
 
+impl<T: 'static, U: 'static, E: 'static> ActorRef<T, U, E>
+    where E: From<CallError<T>>,
+{
+    /// A handle to the currently-running actor
+    pub fn current() -> Option<Self> {
+        if CURRENT_ACTOR_REF.is_set() {
+            CURRENT_ACTOR_REF.with(|any| {
+                unsafe { &**any }.downcast_ref::<mpsc::Sender<Envelope<T, U, E>>>().cloned()
+                    .map(|tx| ActorRef { tx: tx })
+            })
+        } else {
+            None
+        }
+    }
+}
+
 impl<T, U, E> Clone for ActorRef<T, U, E> {
     fn clone(&self) -> Self {
         ActorRef { tx: self.tx.clone() }
@@ -373,13 +394,15 @@ impl<T, U, E> Future for ActorFuture<T, U, E>
 
 impl<A: Actor> ActorCell<A> {
     fn new(actor: A,
+           tx: mpsc::Sender<Envelope<A::Request, A::Response, A::Error>>,
            rx: mpsc::Receiver<Envelope<A::Request, A::Response, A::Error>>,
            max_in_flight: usize)
         -> ActorCell<A>
     {
         ActorCell {
-            actor: actor,
+            _actor: actor,
             state: ActorStatePriv::Listening,
+            tx: tx,
             rx: rx,
             futures: vec![],
             next_future: 0,
@@ -417,7 +440,8 @@ impl<A: Actor> ActorCell<A> {
         }
 
         // Poke the actor
-        if self.actor.poll(self.state.as_pub()).is_ready() {
+        let state = self.state.as_pub();
+        if self.with_actor(move |a| a.poll(state).is_ready()) {
             // Shutdown the actor
             self.state = ActorStatePriv::Shutdown;
             self.rx.close();
@@ -429,7 +453,7 @@ impl<A: Actor> ActorCell<A> {
             match self.rx.poll() {
                 Ok(Async::Ready(Some(msg))) => {
                     let Envelope { arg, ret } = msg;
-                    let fut = self.actor.call(arg).into_future();
+                    let fut = self.with_actor(|a| a.call(arg).into_future());
 
                     let mut processing = Processing {
                         future: fut,
@@ -463,7 +487,7 @@ impl<A: Actor> ActorCell<A> {
     fn is_call_ready(&mut self) -> bool {
         match self.state {
             ActorStatePriv::Listening => {
-                self.active < self.max && self.actor.poll_ready().is_ready()
+                self.active < self.max && self.with_actor(|a| a.poll_ready().is_ready())
             }
             _ => false,
         }
@@ -492,6 +516,13 @@ impl<A: Actor> ActorCell<A> {
         self.active -= 1;
         self.futures[idx] = Slot::Next(self.next_future);
         self.next_future = idx;
+    }
+
+    fn with_actor<F, R>(&mut self, func: F) -> R
+        where F: FnOnce(&mut A) -> R,
+    {
+        let ptr: *const ::std::any::Any = &self.tx;
+        CURRENT_ACTOR_REF.set(&ptr, move || func(&mut self._actor))
     }
 }
 
