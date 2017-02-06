@@ -152,9 +152,21 @@ pub struct ActorCell<A: Actor> {
     max: usize,
 }
 
+/// The sender to a potentially running actor
+pub struct Outbox<T, U, E>(mpsc::Sender<Envelope<T, U, E>>);
+
+impl<T, U, E> Clone for Outbox<T, U, E> {
+    fn clone(&self) -> Self {
+        Outbox(self.0.clone())
+    }
+}
+
 /// Handle to an actor, used to send messages
-pub struct ActorRef<T, U, E> {
-    tx: mpsc::Sender<Envelope<T, U, E>>,
+pub enum ActorRef<T, U, E> {
+    /// All messages sent will be dropped immediately
+    Null(fn() -> U),
+    /// The sender to a potentially running actor
+    Outbox(Outbox<T, U, E>),
 }
 
 /// Used to represent `call` errors
@@ -254,7 +266,7 @@ impl Builder {
         let (tx, rx) = mpsc::channel(self.inbox);
 
         let rx = ActorCell::new(actor, tx.clone(), rx, self.in_flight);
-        let tx = ActorRef { tx: tx };
+        let tx = ActorRef::Outbox(Outbox(tx));
 
         (tx, rx)
     }
@@ -300,12 +312,25 @@ impl<T, U, E> ActorRef<T, U, E>
 {
     /// Returns `Async::Ready` when the actor can accept a new request
     pub fn poll_ready(&mut self) -> Async<()> {
-        self.tx.poll_ready()
+        match self {
+            &mut ActorRef::Null(..) => Async::Ready(()),
+            &mut ActorRef::Outbox(Outbox(ref mut tx)) => tx.poll_ready(),
+        }
     }
 
     /// Send a request to the actor
     pub fn call(&mut self, request: T) -> ActorFuture<T, U, E> {
         let (tx, rx) = oneshot::channel();
+
+        let outbox = match self {
+            &mut ActorRef::Null(f) => {
+                tx.complete(Ok(f()));
+                return ActorFuture {
+                    state: CallState::Waiting(rx),
+                };
+            },
+            &mut ActorRef::Outbox(Outbox(ref mut tx)) => tx,
+        };
 
         let envelope = Envelope {
             arg: request,
@@ -313,7 +338,7 @@ impl<T, U, E> ActorRef<T, U, E>
         };
 
         // TODO: impl the send
-        let state = match self.tx.start_send(envelope) {
+        let state = match outbox.start_send(envelope) {
             Ok(AsyncSink::Ready) => {
                 CallState::Waiting(rx)
             }
@@ -339,7 +364,7 @@ impl<T: 'static, U: 'static, E: 'static> ActorRef<T, U, E>
         if CURRENT_ACTOR_REF.is_set() {
             CURRENT_ACTOR_REF.with(|any| {
                 unsafe { &**any }.downcast_ref::<mpsc::Sender<Envelope<T, U, E>>>().cloned()
-                    .map(|tx| ActorRef { tx: tx })
+                    .map(|tx| ActorRef::Outbox(Outbox(tx)))
             })
         } else {
             None
@@ -347,9 +372,20 @@ impl<T: 'static, U: 'static, E: 'static> ActorRef<T, U, E>
     }
 }
 
+impl<T, E> ActorRef<T, (), E> {
+    /// A handle which drops all calls and returns `()`
+    pub fn null() -> Self {
+        fn _null() {}
+        ActorRef::Null(_null)
+    }
+}
+
 impl<T, U, E> Clone for ActorRef<T, U, E> {
     fn clone(&self) -> Self {
-        ActorRef { tx: self.tx.clone() }
+        match self {
+            &ActorRef::Null(f) => ActorRef::Null(f),
+            &ActorRef::Outbox(ref o) => ActorRef::Outbox(o.clone()),
+        }
     }
 }
 
