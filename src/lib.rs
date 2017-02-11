@@ -533,7 +533,7 @@ impl<A: Actor> ActorCell<A> {
         debug_assert!(self.active < self.max);
 
         // If the `futures` slab is at capacity, grow by 1
-        if self.next_future == self.futures.capacity() {
+        if self.next_future == self.futures.len() {
             debug_assert!(self.next_future < self.max);
 
             self.futures.reserve(1);
