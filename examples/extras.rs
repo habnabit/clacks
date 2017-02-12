@@ -170,14 +170,20 @@ impl<S: 'static, A: 'static> Actor for StreamConsumerActorFeeder<S, A>
     type Error = S::Error;
     type Future = A::Future;
 
+    fn call(&mut self, req: Self::Request) -> Self::Future {
+        self.actor.call(req)
+    }
+
     fn poll(&mut self, state: kabuki::ActorState) -> Async<()> {
         self.try_poll()
             .unwrap_or_else(|_| panic!("XXX poll broke"));
-        least_ready(self.done_processing(), ready_to_end(state))
+        least_ready(
+            least_ready(self.done_processing(), ready_to_end(state)),
+            self.actor.poll(state))
     }
 
-    fn call(&mut self, req: Self::Request) -> Self::Future {
-        self.actor.call(req)
+    fn poll_ready(&mut self) -> Async<()> {
+        self.actor.poll_ready()
     }
 }
 
@@ -249,6 +255,14 @@ impl<A: 'static, E: 'static> Actor for ResponseQueueActor<A, E>
                 .and_then(|q| future::join_all(q.queue))
                 .map(|_: Vec<()>| ())
         })
+    }
+
+    fn poll(&mut self, state: kabuki::ActorState) -> Async<()> {
+        self.actor.poll(state)
+    }
+
+    fn poll_ready(&mut self) -> Async<()> {
+        self.actor.poll_ready()
     }
 }
 
