@@ -7,32 +7,44 @@ use futures::future::FutureResult;
 use kabuki::Actor;
 use std::iter;
 
-pub struct SinkFull<T>(pub T);
-pub struct SinkActor<S: 'static, F: 'static>(S, F)
-    where S: Sink,
-          F: FnMut(S::SinkError);
+fn ready_to_end(state: kabuki::ActorState) -> Async<()> {
+    if state == kabuki::ActorState::Listening {
+        Async::NotReady
+    } else {
+        Async::Ready(())
+    }
+}
 
-impl<S: 'static, F: 'static> SinkActor<S, F>
+fn least_ready(a: Async<()>, b: Async<()>) -> Async<()> {
+    use futures::Async::*;
+    match (a, b) {
+        (Ready(()), Ready(())) => Ready(()),
+        _ => NotReady,
+    }
+}
+
+pub struct SinkFull<T>(pub T);
+pub struct SinkActor<S: 'static>(S) where S: Sink;
+
+impl<S: 'static> SinkActor<S>
     where S: Sink,
           S::SinkError: From<SinkFull<S::SinkItem>>,
-          F: FnMut(S::SinkError),
 {
-    pub fn new(sink: S, func: F) -> Self {
-        SinkActor(sink, func)
+    pub fn new(sink: S) -> Self {
+        SinkActor(sink)
     }
 
-    pub fn spawn_default<SP>(spawn: &SP, sink: S, func: F) -> kabuki::ActorRef<S::SinkItem, (), S::SinkError>
+    pub fn spawn_default<SP>(spawn: &SP, sink: S) -> kabuki::ActorRef<S::SinkItem, (), S::SinkError>
         where SP: futures_spawn::Spawn<kabuki::ActorCell<Self>>,
     {
-        kabuki::Builder::new().spawn(spawn, SinkActor::new(sink, func))
+        kabuki::Builder::new().spawn(spawn, SinkActor::new(sink))
     }
 }
 
 
-impl<S: 'static, F: 'static> SinkActor<S, F>
+impl<S: 'static> SinkActor<S>
     where S: Sink,
           S::SinkError: From<SinkFull<S::SinkItem>>,
-          F: FnMut(S::SinkError),
 {
     fn enqueue(&mut self, item: S::SinkItem) -> Result<(), S::SinkError> {
         match self.0.start_send(item)? {
@@ -42,20 +54,15 @@ impl<S: 'static, F: 'static> SinkActor<S, F>
     }
 
     fn poll_sink(&mut self) -> Async<()> {
-        match self.0.poll_complete() {
-            Ok(a) => a,
-            Err(e) => {
-                (self.1)(e);
-                Async::NotReady
-            },
-        }
+        self.0
+            .poll_complete()
+            .unwrap_or_else(|_| panic!("XXX poll_complete broke"))
     }
 }
 
-impl<S: 'static, F: 'static> kabuki::Actor for SinkActor<S, F>
+impl<S: 'static> kabuki::Actor for SinkActor<S>
     where S: Sink,
           S::SinkError: From<SinkFull<S::SinkItem>>,
-          F: FnMut(S::SinkError),
 {
     type Request = S::SinkItem;
     type Response = ();
@@ -66,9 +73,8 @@ impl<S: 'static, F: 'static> kabuki::Actor for SinkActor<S, F>
         future::result(self.enqueue(item))
     }
 
-    fn poll(&mut self, _: kabuki::ActorState) -> Async<()> {
-        self.poll_sink();
-        Async::NotReady
+    fn poll(&mut self, state: kabuki::ActorState) -> Async<()> {
+        least_ready(self.poll_sink(), ready_to_end(state))
     }
 
     fn poll_ready(&mut self) -> Async<()> {
@@ -117,15 +123,15 @@ impl<S: 'static, A: 'static> StreamConsumerActorFeeder<S, A>
         }
     }
 
-    fn still_processing(&self, state: kabuki::ActorState) -> Async<()> {
-        if state != kabuki::ActorState::Listening && self.processing.is_empty() {
+    fn done_processing(&self) -> Async<()> {
+        if self.processing.is_empty() {
             Async::Ready(())
         } else {
             Async::NotReady
         }
     }
 
-    fn try_poll(&mut self, state: kabuki::ActorState) -> Result<Async<()>, S::Error> {
+    fn try_poll(&mut self) -> Result<(), S::Error> {
         for fut_opt in &mut self.processing {
             match fut_opt.as_mut().map(Future::poll) {
                 Some(Ok(Async::Ready(()))) => *fut_opt = None,
@@ -151,7 +157,7 @@ impl<S: 'static, A: 'static> StreamConsumerActorFeeder<S, A>
                 Async::NotReady => self.processing.push(Some(fut)),
             }
         }
-        Ok(self.still_processing(state))
+        Ok(())
     }
 }
 
@@ -165,8 +171,9 @@ impl<S: 'static, A: 'static> Actor for StreamConsumerActorFeeder<S, A>
     type Future = A::Future;
 
     fn poll(&mut self, state: kabuki::ActorState) -> Async<()> {
-        self.try_poll(state)
-            .unwrap_or_else(|_| panic!("XXX poll broke"))
+        self.try_poll()
+            .unwrap_or_else(|_| panic!("XXX poll broke"));
+        least_ready(self.done_processing(), ready_to_end(state))
     }
 
     fn call(&mut self, req: Self::Request) -> Self::Future {
