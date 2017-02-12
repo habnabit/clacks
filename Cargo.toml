@@ -11,7 +11,6 @@ tokio-core = "0.1"
 futures-threadpool = "0.1"
 futures-mpsc = "0.1"
 scoped-tls = "0.1.0"
-typemap = "0.3.3"
 
 [dependencies.futures-spawn]
 version = "0.1"
