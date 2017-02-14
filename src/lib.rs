@@ -22,7 +22,6 @@
 // - Use UnparkEvent once in-flight passes some threshold
 // - Conditionally depend on tokio-core
 
-#[macro_use]
 extern crate futures;
 extern crate futures_spawn;
 extern crate futures_mpsc;
@@ -123,16 +122,20 @@ pub struct Builder {
     in_flight: usize,
 }
 
+struct ActorAndOutbox<A: Actor> {
+    actor: A,
+    outbox: Outbox<A::Request, A::Response, A::Error>,
+}
+
 /// Manages the runtime state of an `Actor`.
 pub struct ActorCell<A: Actor> {
     // The actor value
-    _actor: A,
+    actor: ActorAndOutbox<A>,
 
     // Current state of the actor
     state: ActorStatePriv,
 
     // The actors inbox
-    tx: mpsc::Sender<Envelope<A::Request, A::Response, A::Error>>,
     rx: mpsc::Receiver<Envelope<A::Request, A::Response, A::Error>>,
 
     // A slab of futures that are being executed. Each slot in this vector is
@@ -207,6 +210,15 @@ pub fn actor_fn<F, T, U>(f: F) -> ActorFn<F, T>
 }
 
 scoped_thread_local!(static CURRENT_ACTOR_REF: *const ::std::any::Any);
+
+impl<A: Actor> ActorAndOutbox<A> {
+    fn with<F, R>(&mut self, func: F) -> R
+        where F: FnOnce(&mut A) -> R,
+    {
+        let ptr: *const ::std::any::Any = &self.outbox.0;
+        CURRENT_ACTOR_REF.set(&ptr, move || func(&mut self.actor))
+    }
+}
 
 /*
  *
@@ -436,9 +448,11 @@ impl<A: Actor> ActorCell<A> {
         -> ActorCell<A>
     {
         ActorCell {
-            _actor: actor,
+            actor: ActorAndOutbox {
+                actor: actor,
+                outbox: Outbox(tx),
+            },
             state: ActorStatePriv::Listening,
-            tx: tx,
             rx: rx,
             futures: vec![],
             next_future: 0,
@@ -459,7 +473,7 @@ impl<A: Actor> ActorCell<A> {
                         ret = Async::NotReady;
                         continue;
                     }
-                }
+                },
                 _ => continue,
             }
 
@@ -477,7 +491,7 @@ impl<A: Actor> ActorCell<A> {
 
         // Poke the actor
         let state = self.state.as_pub();
-        if self.with_actor(move |a| a.poll(state).is_ready()) {
+        if self.actor.with(move |a| a.poll(state).is_ready()) {
             // Shutdown the actor
             self.state = ActorStatePriv::Shutdown;
             self.rx.close();
@@ -489,7 +503,7 @@ impl<A: Actor> ActorCell<A> {
             match self.rx.poll() {
                 Ok(Async::Ready(Some(msg))) => {
                     let Envelope { arg, ret } = msg;
-                    let fut = self.with_actor(|a| a.call(arg).into_future());
+                    let fut = self.actor.with(|a| a.call(arg)).into_future();
 
                     let mut processing = Processing {
                         future: fut,
@@ -523,7 +537,7 @@ impl<A: Actor> ActorCell<A> {
     fn is_call_ready(&mut self) -> bool {
         match self.state {
             ActorStatePriv::Listening => {
-                self.active < self.max && self.with_actor(|a| a.poll_ready().is_ready())
+                self.active < self.max && self.actor.with(|a| a.poll_ready()).is_ready()
             }
             _ => false,
         }
@@ -552,13 +566,6 @@ impl<A: Actor> ActorCell<A> {
         self.active -= 1;
         self.futures[idx] = Slot::Next(self.next_future);
         self.next_future = idx;
-    }
-
-    fn with_actor<F, R>(&mut self, func: F) -> R
-        where F: FnOnce(&mut A) -> R,
-    {
-        let ptr: *const ::std::any::Any = &self.tx;
-        CURRENT_ACTOR_REF.set(&ptr, move || func(&mut self._actor))
     }
 }
 
