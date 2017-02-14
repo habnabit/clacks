@@ -81,6 +81,17 @@ pub trait Actor {
     fn call(&mut self, req: Self::Request) -> Self::Future;
 }
 
+/// An indication of whether to make a tail call back into the same actor or
+/// return a response.
+pub enum TailCall<R, U> {
+    /// Make another call into the actor. This will use the same processing
+    /// slot as the last call, so the new call won't have to wait or use up
+    /// another processing slot.
+    Call(R),
+    /// The call has completed.
+    Complete(U),
+}
+
 /// An actor implemented by a closure.
 pub struct ActorFn<F, T> {
     f: F,
@@ -122,21 +133,21 @@ pub struct Builder {
     in_flight: usize,
 }
 
-struct ActorAndOutbox<A: Actor> {
+struct ActorAndOutbox<A: Actor, U> {
     actor: A,
-    outbox: Outbox<A::Request, A::Response, A::Error>,
+    outbox: Outbox<A::Request, U, A::Error>,
 }
 
 /// Manages the runtime state of an `Actor`.
-pub struct ActorCell<A: Actor> {
+pub struct ActorCell<A: Actor, U: 'static> {
     // The actor value
-    actor: ActorAndOutbox<A>,
+    actor: ActorAndOutbox<A, U>,
 
     // Current state of the actor
     state: ActorStatePriv,
 
     // The actors inbox
-    rx: mpsc::Receiver<Envelope<A::Request, A::Response, A::Error>>,
+    rx: mpsc::Receiver<Envelope<A::Request, U, A::Error>>,
 
     // A slab of futures that are being executed. Each slot in this vector is
     // either an active future or a pointer to the next empty slot. This is used
@@ -145,7 +156,7 @@ pub struct ActorCell<A: Actor> {
     // The `next_future` field is the next slot in the `futures` array that's a
     // `Slot::Next` variant. If it points to the end of the array then the array
     // is full.
-    futures: Vec<Slot<Processing<A>>>,
+    futures: Vec<Slot<Processing<A, U>>>,
     next_future: usize,
 
     // Number of active futures running in the `futures` slab
@@ -153,6 +164,8 @@ pub struct ActorCell<A: Actor> {
 
     // Maximum number of in-flight futures
     max: usize,
+
+    trampoline: fn(A::Response) -> TailCall<A::Request, U>,
 }
 
 /// The sender to a potentially running actor
@@ -187,9 +200,9 @@ struct Envelope<T, U, E> {
     ret: oneshot::Sender<Result<U, E>>,
 }
 
-struct Processing<A: Actor> {
+struct Processing<A: Actor, U: 'static> {
     future: <A::Future as IntoFuture>::Future,
-    ret: Option<oneshot::Sender<Result<A::Response, A::Error>>>,
+    ret: Option<oneshot::Sender<Result<U, A::Error>>>,
 }
 
 // Stores in-flight responses
@@ -211,7 +224,7 @@ pub fn actor_fn<F, T, U>(f: F) -> ActorFn<F, T>
 
 scoped_thread_local!(static CURRENT_ACTOR_REF: *const ::std::any::Any);
 
-impl<A: Actor> ActorAndOutbox<A> {
+impl<A: Actor, U: 'static> ActorAndOutbox<A, U> {
     fn with<F, R>(&mut self, func: F) -> R
         where F: FnOnce(&mut A) -> R,
     {
@@ -253,9 +266,21 @@ impl Builder {
     pub fn spawn<A, S>(self, s: &S, actor: A)
         -> ActorRef<A::Request, A::Response, A::Error>
         where A: Actor,
-              S: Spawn<ActorCell<A>>,
+              S: Spawn<ActorCell<A, A::Response>>,
     {
-        let (tx, rx) = self.pair(actor);
+        let (tx, rx) = self.pair(actor, TailCall::Complete);
+        s.spawn_detached(rx);
+        tx
+    }
+
+    /// Spawn a new tail-recursive-capable actor
+    pub fn spawn_tail_recursive<A, S, U>(self, s: &S, actor: A)
+        -> ActorRef<A::Request, U, A::Error>
+        where A: Actor<Response = TailCall<<A as Actor>::Request, U>>,
+              S: Spawn<ActorCell<A, U>>,
+    {
+        fn _identity<T>(x: T) -> T { x }
+        let (tx, rx) = self.pair(actor, _identity);
         s.spawn_detached(rx);
         tx
     }
@@ -265,19 +290,19 @@ impl Builder {
         -> ActorRef<T, U::Item, U::Error>
         where F: FnMut(T) -> U,
               U: IntoFuture,
-              S: Spawn<ActorCell<ActorFn<F, T>>>,
+              S: Spawn<ActorCell<ActorFn<F, T>, U::Item>>,
     {
         self.spawn(s, actor_fn(f))
     }
 
-    fn pair<A>(self, actor: A)
-        -> (ActorRef<A::Request, A::Response, A::Error>, ActorCell<A>)
+    fn pair<A, U>(self, actor: A, trampoline: fn(A::Response) -> TailCall<A::Request, U>)
+        -> (ActorRef<A::Request, U, A::Error>, ActorCell<A, U>)
         where A: Actor,
     {
         // TODO: respect inbox bound
         let (tx, rx) = mpsc::channel(self.inbox);
 
-        let rx = ActorCell::new(actor, tx.clone(), rx, self.in_flight);
+        let rx = ActorCell::new(actor, tx.clone(), rx, self.in_flight, trampoline);
         let tx = ActorRef::Outbox(Outbox(tx));
 
         (tx, rx)
@@ -440,12 +465,13 @@ impl<T, U, E> Future for ActorFuture<T, U, E>
  *
  */
 
-impl<A: Actor> ActorCell<A> {
+impl<A: Actor, U> ActorCell<A, U> {
     fn new(actor: A,
-           tx: mpsc::Sender<Envelope<A::Request, A::Response, A::Error>>,
-           rx: mpsc::Receiver<Envelope<A::Request, A::Response, A::Error>>,
-           max_in_flight: usize)
-        -> ActorCell<A>
+           tx: mpsc::Sender<Envelope<A::Request, U, A::Error>>,
+           rx: mpsc::Receiver<Envelope<A::Request, U, A::Error>>,
+           max_in_flight: usize,
+           trampoline: fn(A::Response) -> TailCall<A::Request, U>)
+        -> ActorCell<A, U>
     {
         ActorCell {
             actor: ActorAndOutbox {
@@ -458,6 +484,7 @@ impl<A: Actor> ActorCell<A> {
             next_future: 0,
             active: 0,
             max: max_in_flight,
+            trampoline: trampoline,
         }
     }
 
@@ -469,9 +496,13 @@ impl<A: Actor> ActorCell<A> {
             // Poll the future
             match self.futures[i] {
                 Slot::Data(ref mut f) => {
-                    if !f.poll().is_ready() {
-                        ret = Async::NotReady;
-                        continue;
+                    let actor = &mut self.actor;
+                    match f.poll(&mut self.trampoline, &mut |r| actor.with(|a| a.call(r))) {
+                        Async::NotReady => {
+                            ret = Async::NotReady;
+                            continue;
+                        },
+                        Async::Ready(()) => (),
                     }
                 },
                 _ => continue,
@@ -510,7 +541,11 @@ impl<A: Actor> ActorCell<A> {
                         ret: Some(ret),
                     };
 
-                    if processing.poll().is_ready() {
+                    let processing_poll = {
+                        let actor = &mut self.actor;
+                        processing.poll(&mut self.trampoline, &mut |r| actor.with(|a| a.call(r)))
+                    };
+                    if processing_poll.is_ready() {
                         // request done, move on to the next one
                         continue;
                     }
@@ -543,7 +578,7 @@ impl<A: Actor> ActorCell<A> {
         }
     }
 
-    fn push_processing(&mut self, processing: Processing<A>) {
+    fn push_processing(&mut self, processing: Processing<A, U>) {
         debug_assert!(self.active < self.max);
 
         // If the `futures` slab is at capacity, grow by 1
@@ -569,7 +604,7 @@ impl<A: Actor> ActorCell<A> {
     }
 }
 
-impl<A: Actor> Future for ActorCell<A> {
+impl<A: Actor, U> Future for ActorCell<A, U> {
     type Item = ();
     type Error = ();
 
@@ -596,8 +631,9 @@ impl<A: Actor> Future for ActorCell<A> {
  *
  */
 
-impl<A: Actor> Processing<A> {
-    fn poll(&mut self) -> Async<()> {
+impl<A: Actor, U: 'static> Processing<A, U> {
+    fn poll(&mut self, mut trampoline: &mut FnMut(A::Response) -> TailCall<A::Request, U>, mut call_actor: &mut FnMut(A::Request) -> A::Future) -> Async<()>
+    {
         {
             // First, check to see if there is still interest on the receiving
             // the value
@@ -609,7 +645,15 @@ impl<A: Actor> Processing<A> {
         }
 
         let ret = match self.future.poll() {
-            Ok(Async::Ready(v)) => Ok(v),
+            Ok(Async::Ready(v)) => {
+                match trampoline(v) {
+                    TailCall::Complete(v) => Ok(v),
+                    TailCall::Call(c) => {
+                        self.future = call_actor(c).into_future();
+                        return self.poll(trampoline, call_actor);
+                    },
+                }
+            },
             Ok(Async::NotReady) => return Async::NotReady,
             Err(e) => Err(e),
         };
