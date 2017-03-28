@@ -361,7 +361,7 @@ impl<T, U, E> ActorRef<T, U, E>
 
         let outbox = match self {
             &mut ActorRef::Null(f) => {
-                tx.complete(Ok(f()));
+                let _ = tx.send(Ok(f()));
                 return ActorFuture {
                     state: CallState::Waiting(rx),
                 };
@@ -658,8 +658,7 @@ impl<A: Actor, U: 'static> Processing<A, U> {
             Err(e) => Err(e),
         };
 
-        self.ret.take().expect("return channel already consumed")
-            .complete(ret);
+        let _ = self.ret.take().expect("return channel already consumed").send(ret);
 
         Async::Ready(())
     }
