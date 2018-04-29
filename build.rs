@@ -4,7 +4,7 @@ use std::io::{self, Read, Write};
 use std::{fs, path};
 
 const TL_DIR: &str = "tl";
-const OUTPUT_FILE: &str = "src/mtproto_.rs";
+const OUTPUT_FILE: &str = "src/mtproto.rs";
 
 fn main_result() -> Result<(), io::Error> {
     let mut files = fs::read_dir(TL_DIR)?

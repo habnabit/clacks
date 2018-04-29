@@ -1,13 +1,15 @@
 [package]
 name = "clacks"
 version = "0.0.1"
-authors = ["Aaron Gallagher <_@habnab.it>"]
+authors = ["Aaron Gallagher <_@habnab.it>", "Connie Hilarides <connorcpu@live.com>"]
+license = "MIT/Apache-2.0"
+description = "minimal wrappers for telegram's mtproto serialization"
 
 [dependencies]
-byteorder = "*"
-error-chain = "*"
-extfmt = "*"
-void = "*"
+byteorder = "1.2"
+error-chain = "0.11"
+extfmt = "0.1"
+void = "1.0"
 
 [build-dependencies.clacks_tl_codegen]
 path = "clacks_tl_codegen"
