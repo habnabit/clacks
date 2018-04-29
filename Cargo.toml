@@ -1,0 +1,13 @@
+[package]
+name = "clacks"
+version = "0.1.0"
+authors = ["Aaron Gallagher <_@habnab.it>"]
+
+[dependencies]
+byteorder = "*"
+error-chain = "*"
+extfmt = "*"
+void = "*"
+
+[build-dependencies.clacks_tl_codegen]
+path = "clacks_tl_codegen"

@@ -1,0 +1,12 @@
+[package]
+name = "clacks_tl_codegen"
+version = "0.1.0"
+authors = ["Aaron Gallagher <_@habnab.it>"]
+
+[dependencies]
+pom = "1"
+
+syn = "*"
+quote = "*"
+
+[lib]
