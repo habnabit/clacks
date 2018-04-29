@@ -1,6 +1,6 @@
 [package]
 name = "clacks"
-version = "0.1.0"
+version = "0.0.1"
 authors = ["Aaron Gallagher <_@habnab.it>"]
 
 [dependencies]
@@ -11,3 +11,4 @@ void = "*"
 
 [build-dependencies.clacks_tl_codegen]
 path = "clacks_tl_codegen"
+version = "0.0.1"
