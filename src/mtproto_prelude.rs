@@ -1,8 +1,7 @@
-use ::{AnyBoxedSerialize, BareDeserialize, BareSerialize, Deserialize, Deserializer, Result, Serialize, Serializer};
+use ::{AnyBoxedSerialize, BareDeserialize, BareSerialize, BoxedDeserialize, BoxedSerialize, ConstructorNumber, Deserializer, Result, Serializer};
 use extfmt::Hexlify;
 use std::fmt;
 use std::marker::PhantomData;
-use void::Void;
 
 #[derive(Clone)]
 pub struct bytes(pub Vec<u8>);
@@ -14,10 +13,9 @@ impl fmt::Debug for bytes {
 }
 
 impl BareDeserialize for bytes {
-    fn deserialize_bare(de: &mut Deserializer) -> Result<Self>
-        where Self: Sized
-    {
-        unimplemented!()
+    fn deserialize_bare(de: &mut Deserializer) -> Result<Self> {
+        let vec = de.read_bare::<Vector<Bare, u8>>()?;
+        Ok(bytes(vec.0))
     }
 }
 
@@ -27,42 +25,25 @@ impl BareSerialize for bytes {
     }
 }
 
-impl Deserialize for bytes {
-    type Output = Self;
-    fn deserialize(de: &mut Deserializer) -> Result<Self::Output> {
-        unimplemented!()
-    }
-}
-
-impl Serialize for bytes {
-    type Input = Self;
-    fn serialize(obj: &Self::Input, ser: &mut Serializer) -> Result<()> {
-        unimplemented!()
-    }
-}
-
 #[derive(Clone, Copy)]
-pub struct Bytes8(pub [u8; 8]);
-pub type int128 = Bytes8;
+pub struct int128(pub [u8; 8]);
 
-impl fmt::Debug for Bytes8 {
+impl fmt::Debug for int128 {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "<{}>", Hexlify(&self.0))
     }
 }
 
-impl BareDeserialize for Bytes8 {
-    fn deserialize_bare(de: &mut Deserializer) -> Result<Self>
-        where Self: Sized
-    {
+impl BareDeserialize for int128 {
+    fn deserialize_bare(de: &mut Deserializer) -> Result<Self> {
         use std::io::Read;
         let mut buf = [0u8; 8];
         de.read(&mut buf)?;
-        Ok(Bytes8(buf))
+        Ok(int128(buf))
     }
 }
 
-impl BareSerialize for Bytes8 {
+impl BareSerialize for int128 {
     fn serialize_bare(&self, ser: &mut Serializer) -> Result<()> {
         use std::io::Write;
         ser.write(&self.0)?;
@@ -70,60 +51,29 @@ impl BareSerialize for Bytes8 {
     }
 }
 
-impl Deserialize for Bytes8 {
-    type Output = Self;
-    fn deserialize(de: &mut Deserializer) -> Result<Self::Output> {
-        unimplemented!()
-    }
-}
-
-impl Serialize for Bytes8 {
-    type Input = Self;
-    fn serialize(obj: &Self::Input, ser: &mut Serializer) -> Result<()> {
-        unimplemented!()
-    }
-}
-
 #[derive(Clone, Copy)]
-pub struct Bytes16(pub [u8; 16]);
-pub type int256 = Bytes16;
+pub struct int256(pub [u8; 16]);
 
-impl fmt::Debug for Bytes16 {
+impl fmt::Debug for int256 {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "<{}>", Hexlify(&self.0))
     }
 }
 
-impl BareDeserialize for Bytes16 {
-    fn deserialize_bare(de: &mut Deserializer) -> Result<Self>
-        where Self: Sized
-    {
+impl BareDeserialize for int256 {
+    fn deserialize_bare(de: &mut Deserializer) -> Result<Self> {
         use std::io::Read;
         let mut buf = [0u8; 16];
         de.read(&mut buf)?;
-        Ok(Bytes16(buf))
+        Ok(int256(buf))
     }
 }
 
-impl BareSerialize for Bytes16 {
+impl BareSerialize for int256 {
     fn serialize_bare(&self, ser: &mut Serializer) -> Result<()> {
         use std::io::Write;
         ser.write(&self.0)?;
         Ok(())
-    }
-}
-
-impl Deserialize for Bytes16 {
-    type Output = Self;
-    fn deserialize(de: &mut Deserializer) -> Result<Self::Output> {
-        unimplemented!()
-    }
-}
-
-impl Serialize for Bytes16 {
-    type Input = Self;
-    fn serialize(obj: &Self::Input, ser: &mut Serializer) -> Result<()> {
-        unimplemented!()
     }
 }
 
@@ -137,69 +87,194 @@ impl Clone for TLObject {
 
 impl fmt::Debug for TLObject {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "(TLObject tl_id:{:?})", self.0.type_id())
+        let (type_id, _) = self.0.serialize_boxed();
+        write!(f, "(TLObject tl_id:{:?})", type_id)
     }
 }
 
-pub struct LengthPrefixed<T>(PhantomData<fn(&T) -> T>, Void);
-pub enum TypedObject {}
-pub type LengthPrefixedTypedObject = LengthPrefixed<TypedObject>;
+impl BoxedDeserialize for TLObject {
+    fn possible_constructors() -> Vec<ConstructorNumber> {
+        unimplemented!()
+    }
 
-impl<T: Deserialize> Deserialize for LengthPrefixed<T> {
-    type Output = T::Output;
-    fn deserialize(de: &mut Deserializer) -> Result<Self::Output> {
+    fn deserialize_boxed(id: ConstructorNumber, de: &mut Deserializer) -> Result<Self> {
         unimplemented!()
     }
 }
 
-impl<T: Serialize> Serialize for LengthPrefixed<T> {
-    type Input = T::Input;
-    fn serialize(obj: &Self::Input, ser: &mut Serializer) -> Result<()> {
+impl BoxedSerialize for TLObject {
+    fn serialize_boxed<'this>(&'this self) -> (ConstructorNumber, &'this BareSerialize) {
+        self.0.serialize_boxed()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct LengthPrefixed<T>(pub T);
+
+impl<T> BoxedDeserialize for LengthPrefixed<T>
+    where T: BoxedDeserialize,
+{
+    fn possible_constructors() -> Vec<ConstructorNumber> {
+        unimplemented!()
+    }
+
+    fn deserialize_boxed(id: ConstructorNumber, de: &mut Deserializer) -> Result<Self> {
         unimplemented!()
     }
 }
 
-impl Deserialize for TypedObject {
-    type Output = TLObject;
-    fn deserialize(de: &mut Deserializer) -> Result<Self::Output> {
+impl<T> BoxedSerialize for LengthPrefixed<T>
+    where T: BoxedSerialize,
+{
+    fn serialize_boxed<'this>(&'this self) -> (ConstructorNumber, &'this BareSerialize) {
         unimplemented!()
     }
 }
 
-impl Serialize for TypedObject {
-    type Input = TLObject;
-    fn serialize(obj: &Self::Input, ser: &mut Serializer) -> Result<()> {
+impl BareSerialize for () {
+    fn serialize_bare(&self, _ser: &mut Serializer) -> Result<()> {
+        Ok(())
+    }
+}
+
+impl BoxedDeserialize for bool {
+    fn possible_constructors() -> Vec<ConstructorNumber> {
+        unimplemented!()
+    }
+
+    fn deserialize_boxed(id: ConstructorNumber, de: &mut Deserializer) -> Result<Self> {
         unimplemented!()
     }
 }
 
-pub enum Bool {}
-
-impl Deserialize for Bool {
-    type Output = bool;
-    fn deserialize(de: &mut Deserializer) -> Result<Self::Output> {
+impl BoxedSerialize for bool {
+    fn serialize_boxed<'this>(&'this self) -> (ConstructorNumber, &'this BareSerialize) {
         unimplemented!()
     }
 }
 
-pub enum string {}
-
-impl Deserialize for string {
-    type Output = String;
-    fn deserialize(de: &mut Deserializer) -> Result<Self::Output> {
+impl BareDeserialize for String {
+    fn deserialize_bare(de: &mut Deserializer) -> Result<Self> {
         unimplemented!()
     }
 }
 
-impl Serialize for string {
-    type Input = String;  // XXX: for now?
-    fn serialize(obj: &Self::Input, ser: &mut Serializer) -> Result<()> {
+impl BareSerialize for String {
+    fn serialize_bare(&self, ser: &mut Serializer) -> Result<()> {
         unimplemented!()
     }
 }
+
+impl<T> BoxedDeserialize for Box<T>
+    where T: BoxedDeserialize,
+{
+    fn possible_constructors() -> Vec<ConstructorNumber> {
+        T::possible_constructors()
+    }
+
+    fn deserialize_boxed(id: ConstructorNumber, de: &mut Deserializer) -> Result<Self> {
+        Ok(Box::new(T::deserialize_boxed(id, de)?))
+    }
+}
+
+impl<T> BoxedSerialize for Box<T>
+    where T: BoxedSerialize,
+{
+    fn serialize_boxed<'this>(&'this self) -> (ConstructorNumber, &'this BareSerialize) {
+        T::serialize_boxed(self)
+    }
+}
+
+pub enum Bare {}
+pub enum Boxed {}
+
+pub struct Vector<Det, T>(pub Vec<T>, PhantomData<fn() -> Det>);
+pub type vector<Det, T> = Vector<Det, T>;
+
+impl<Det, T> Clone for Vector<Det, T>
+    where T: Clone,
+{
+    fn clone(&self) -> Self {
+        Vector(self.0.clone(), PhantomData)
+    }
+}
+
+impl<Det, T> fmt::Debug for Vector<Det, T>
+    where T: fmt::Debug,
+{
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "Vector({:?})", self.0)
+    }
+}
+
+const VECTOR_CONSTRUCTOR: ConstructorNumber = ConstructorNumber(0);
+
+macro_rules! impl_vector {
+    ($det:ident, $det_de:ident, $det_ser:ident, $read_method:ident, $write_method:ident) => {
+
+        impl<T> From<Vec<T>> for Vector<$det, T> {
+            fn from(obj: Vec<T>) -> Self {
+                Vector(obj, PhantomData)
+            }
+        }
+
+        impl<T> BareDeserialize for Vector<$det, T>
+            where T: $det_de,
+        {
+            fn deserialize_bare(de: &mut Deserializer) -> Result<Self> {
+                unimplemented!()
+            }
+        }
+
+        impl<T> BoxedDeserialize for Vector<$det, T>
+            where Self: BareDeserialize,
+        {
+            fn possible_constructors() -> Vec<ConstructorNumber> { vec![VECTOR_CONSTRUCTOR] }
+
+            fn deserialize_boxed(id: ConstructorNumber, de: &mut Deserializer) -> Result<Self> {
+                assert_eq!(id, VECTOR_CONSTRUCTOR);
+                Self::deserialize_bare(de)
+            }
+        }
+
+        impl<T> BareSerialize for Vector<$det, T>
+            where T: $det_ser,
+        {
+            fn serialize_bare(&self, ser: &mut Serializer) -> Result<()> {
+                unimplemented!()
+            }
+        }
+
+        impl<T> BoxedSerialize for Vector<$det, T>
+            where Self: BareSerialize,
+        {
+            fn serialize_boxed<'this>(&'this self) -> (ConstructorNumber, &'this BareSerialize) {
+                (VECTOR_CONSTRUCTOR, self)
+            }
+        }
+
+    }
+}
+
+impl BareDeserialize for Vector<Bare, u8> {
+    fn deserialize_bare(de: &mut Deserializer) -> Result<Self> {
+        unimplemented!()
+    }
+}
+
+impl BareSerialize for Vector<Bare, u8> {
+    fn serialize_bare(&self, ser: &mut Serializer) -> Result<()> {
+        unimplemented!()
+    }
+}
+
+impl_vector! { Bare, BareDeserialize, BareSerialize, read_bare, write_bare }
+impl_vector! { Boxed, BoxedDeserialize, BoxedSerialize, read_boxed, write_boxed }
 
 macro_rules! impl_tl_primitive {
     ($tltype:ident, $ptype:ident, $read:ident, $write:ident) => {
+        pub type $tltype = $ptype;
+
         impl BareDeserialize for $ptype {
             fn deserialize_bare(de: &mut Deserializer) -> Result<Self> {
                 use byteorder::{LittleEndian, ReadBytesExt};
@@ -214,22 +289,6 @@ macro_rules! impl_tl_primitive {
                 Ok(())
             }
         }
-
-        pub enum $tltype {}
-
-        impl Deserialize for $tltype {
-            type Output = $ptype;
-            fn deserialize(de: &mut Deserializer) -> Result<Self::Output> {
-                de.read_bare::<$ptype>()
-            }
-        }
-
-        impl Serialize for $tltype {
-            type Input = $ptype;
-            fn serialize(obj: &Self::Input, ser: &mut Serializer) -> Result<()> {
-                ser.write_bare::<$ptype>(obj)
-            }
-        }
     }
 }
 
@@ -237,54 +296,8 @@ impl_tl_primitive! { int, i32, read_i32, write_i32 }
 impl_tl_primitive! { long, i64, read_i64, write_i64 }
 impl_tl_primitive! { double, f64, read_f64, write_f64 }
 
-pub struct vector<T: ?Sized>(PhantomData<fn(&T) -> T>, Void);
-
-impl<T: ?Sized + Deserialize> Deserialize for vector<T> {
-    type Output = Vec<T::Output>;
-    fn deserialize(de: &mut Deserializer) -> Result<Self::Output> {
-        unimplemented!()
-    }
-}
-
-impl<T: Serialize> Serialize for vector<T>
-    where T::Input: Sized,
-{
-    type Input = [T::Input];
-    fn serialize(obj: &Self::Input, ser: &mut Serializer) -> Result<()> {
-        unimplemented!()
-    }
-}
-
-pub struct Vector<T: ?Sized>(PhantomData<fn(&T) -> T>, Void);
-
-impl<T: ?Sized + Deserialize> Deserialize for Vector<T> {
-    type Output = Vec<T::Output>;
-    fn deserialize(de: &mut Deserializer) -> Result<Self::Output> {
-        unimplemented!()
-    }
-}
-
-impl<T: Serialize> Serialize for Vector<T>
-    where T::Input: Sized,
-{
-    type Input = [T::Input];
-    fn serialize(obj: &Self::Input, ser: &mut Serializer) -> Result<()> {
-        unimplemented!()
-    }
-}
-
-pub enum Flags {}
-
-impl Deserialize for Flags {
-    type Output = i32;
-    fn deserialize(de: &mut Deserializer) -> Result<Self::Output> {
-        unimplemented!()
-    }
-}
-
-impl Serialize for Flags {
-    type Input = i32;
-    fn serialize(obj: &Self::Input, ser: &mut Serializer) -> Result<()> {
-        unimplemented!()
-    }
-}
+pub type Bool = bool;
+pub type Flags = i32;
+pub type LengthPrefixedTypedObject = LengthPrefixed<TypedObject>;
+pub type string = String;
+pub type TypedObject = TLObject;

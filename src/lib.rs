@@ -3,7 +3,6 @@
 #[macro_use] extern crate error_chain;
 extern crate byteorder;
 extern crate extfmt;
-extern crate void;
 
 pub mod error;
 pub mod mtproto;
@@ -34,15 +33,12 @@ impl<'r> Deserializer<'r> {
     }
 
     pub fn read_bare<D: BareDeserialize>(&mut self) -> Result<D> {
-        unimplemented!()
+        D::deserialize_bare(self)
     }
 
     pub fn read_boxed<D: BoxedDeserialize>(&mut self) -> Result<D> {
-        unimplemented!()
-    }
-
-    pub fn read_generic<D: Deserialize>(&mut self) -> Result<D::Output> {
-        unimplemented!()
+        let constructor = self.read_constructor()?;
+        D::deserialize_boxed(constructor, self)
     }
 }
 
@@ -52,23 +48,21 @@ impl<'r> io::Read for Deserializer<'r> {
     }
 }
 
-pub trait BareDeserialize {
-    fn deserialize_bare(de: &mut Deserializer) -> Result<Self>
-        where Self: Sized;
+pub trait BareDeserialize
+    where Self: Sized,
+{
+    fn deserialize_bare(de: &mut Deserializer) -> Result<Self>;
 }
 
-pub trait BoxedDeserialize {
-    fn deserialize_boxed(id: ConstructorNumber, de: &mut Deserializer) -> Result<Self>
-        where Self: Sized;
-}
-
-pub trait Deserialize {
-    type Output;
-    fn deserialize(de: &mut Deserializer) -> Result<Self::Output>;
+pub trait BoxedDeserialize
+    where Self: Sized,
+{
+    fn possible_constructors() -> Vec<ConstructorNumber>;
+    fn deserialize_boxed(id: ConstructorNumber, de: &mut Deserializer) -> Result<Self>;
 }
 
 pub trait Function {
-    type Reply: Deserialize;
+    type Reply: BoxedDeserialize;
 }
 
 pub struct Serializer<'w> {
@@ -77,19 +71,19 @@ pub struct Serializer<'w> {
 
 impl<'w> Serializer<'w> {
     pub fn write_constructor(&mut self, id: ConstructorNumber) -> Result<()> {
-        unimplemented!()
+        use byteorder::{LittleEndian, WriteBytesExt};
+        Ok(self.write_u32::<LittleEndian>(id.0)?)
     }
 
-    pub fn write_bare<S: BareSerialize>(&mut self, obj: &S) -> Result<()> {
-        unimplemented!()
+    pub fn write_bare<S: ?Sized + BareSerialize>(&mut self, obj: &S) -> Result<()> {
+        obj.serialize_bare(self)
     }
 
     pub fn write_boxed<S: BoxedSerialize>(&mut self, obj: &S) -> Result<()> {
-        unimplemented!()
-    }
-
-    pub fn write_generic<S: Serialize>(&mut self, obj: &S::Input) -> Result<()> {
-        unimplemented!()
+        let (constructor, bare) = obj.serialize_boxed();
+        self.write_constructor(constructor)?;
+        self.write_bare(bare)?;
+        Ok(())
     }
 }
 
@@ -108,13 +102,12 @@ pub trait BareSerialize {
 }
 
 pub trait BoxedSerialize {
-    fn type_id(&self) -> ConstructorNumber;
-    fn serialize_boxed(&self, ser: &mut Serializer) -> Result<()>;
+    fn serialize_boxed<'this>(&'this self) -> (ConstructorNumber, &'this BareSerialize);
 }
 
-pub trait Serialize {
-    type Input: ?Sized;
-    fn serialize(obj: &Self::Input, ser: &mut Serializer) -> Result<()>;
+pub trait IntoBoxed: BareSerialize {
+    type Boxed: BoxedSerialize;
+    fn into_boxed(self) -> Self::Boxed;
 }
 
 pub trait AnyBoxedSerialize: Any + BoxedSerialize {}

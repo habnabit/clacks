@@ -226,6 +226,10 @@ pub use parser::{Constructor, Delimiter, Field, Item, Type};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::mem;
 
+fn fail_hard() -> quote::Tokens {
+    quote!(FAIL_LOUDLY_AT_COMPILE_TIME!())
+}
+
 #[derive(Debug, Default)]
 struct Constructors(Vec<Constructor>);
 
@@ -364,30 +368,46 @@ impl WireKind {
         WireKind::TypeParameter(quote! { #id })
     }
 
-    fn become_deserialize_output(&mut self) {
-        use self::WireKind::*;
-        let ty_loc = match *self {
-            Bare(ref mut t) |
-            Boxed(ref mut t) => t,
-            _ => return,
-        };
-        let ty = ty_loc.clone();
-        *ty_loc = quote!(<#ty as ::Deserialize>::Output);
-    }
-
-    fn become_container_for(&mut self, contained: Self) {
+    fn become_container_for(&mut self, include_determiner: bool, contained: Self) {
         use self::WireKind::*;
         let ty_loc = match *self {
             Bare(ref mut t) |
             Boxed(ref mut t) => t,
             _ => unimplemented!(),
         };
-        let contained = match contained {
-            Bare(t) | Boxed(t) | TypeParameter(t) => t,
-            _ => unimplemented!(),
+        let contained = if include_determiner {
+            match contained {
+                Bare(t) => quote!(::mtproto::Bare, #t),
+                Boxed(t) |
+                TypeParameter(t) => quote!(::mtproto::Boxed, #t),
+                _ => unimplemented!(),
+            }
+        } else {
+            match contained {
+                Bare(t) | Boxed(t) | TypeParameter(t) => t,
+                _ => unimplemented!(),
+            }
         };
         let ty = ty_loc.clone();
         *ty_loc = quote!(#ty<#contained>);
+    }
+
+    fn as_read_method(&self) -> quote::Tokens {
+        use self::WireKind::*;
+        match *self {
+            Bare(..) | Flags => quote!(read_bare),
+            Boxed(..) | TypeParameter(..) => quote!(read_boxed),
+            FlaggedTrue => fail_hard(),
+        }
+    }
+
+    fn as_write_method(&self) -> quote::Tokens {
+        use self::WireKind::*;
+        match *self {
+            Bare(..) | Flags => quote!(write_bare),
+            Boxed(..) | TypeParameter(..) => quote!(write_boxed),
+            FlaggedTrue => fail_hard(),
+        }
     }
 }
 
@@ -395,6 +415,7 @@ impl WireKind {
 struct TypeIR {
     wire_kind: WireKind,
     needs_box: bool,
+    needs_determiner: bool,
     with_option: bool,
 }
 
@@ -409,6 +430,11 @@ impl TypeIR {
                 Some("RichText") => true,
                 _ => false,
             },
+            needs_determiner: match names.last().map(String::as_str) {
+                Some("vector") |
+                Some("Vector") => true,
+                _ => false,
+            },
         }
     }
 
@@ -416,6 +442,7 @@ impl TypeIR {
         TypeIR {
             wire_kind: WireKind::type_parameter(name),
             needs_box: false,
+            needs_determiner: false,
             with_option: false,
         }
     }
@@ -424,18 +451,14 @@ impl TypeIR {
         TypeIR {
             wire_kind: WireKind::Flags,
             needs_box: false,
+            needs_determiner: false,
             with_option: false,
         }
     }
 
     fn with_container(self, mut container: TypeIR) -> Self {
-        container.wire_kind.become_container_for(self.wire_kind);
+        container.wire_kind.become_container_for(container.needs_determiner, self.wire_kind);
         container
-    }
-
-    fn with_deserialize_output(mut self) -> Self {
-        self.wire_kind.become_deserialize_output();
-        self
     }
 
     fn with_option_wrapper(mut self) -> Self {
@@ -445,19 +468,34 @@ impl TypeIR {
 
     fn io_turbofish(&self) -> quote::Tokens {
         use self::WireKind::*;
-        println!("turbofish for: {:?}", self);
-        match self.wire_kind {
-            Bare(ref t) | Boxed(ref t) | TypeParameter(ref t) => quote!(::<#t>),
-            Flags => quote!(::<::mtproto::Flags>),
-            _ => quote!(FAIL_LOUDLY_AT_COMPILE_TIME),
+        let mut ty = match self.wire_kind {
+            Flags => quote!(::mtproto::Flags),
+            _ => self.non_field_type(),
+        };
+        if self.needs_box {
+            ty = quote!(Box<#ty>);
         }
+        quote!(::<#ty>)
+    }
+
+    fn assemble_method(&self, method: quote::Tokens) -> quote::Tokens {
+        let turbofish = self.io_turbofish();
+        quote!(#method #turbofish)
+    }
+
+    fn as_read_method(&self) -> quote::Tokens {
+        self.assemble_method(self.wire_kind.as_read_method())
+    }
+
+    fn as_write_method(&self) -> quote::Tokens {
+        self.assemble_method(self.wire_kind.as_write_method())
     }
 
     fn non_field_type(&self) -> quote::Tokens {
         use self::WireKind::*;
         match self.wire_kind {
             Bare(ref t) | Boxed(ref t) | TypeParameter(ref t) => t.clone(),
-            _ => quote!(FAIL_LOUDLY_AT_COMPILE_TIME),
+            _ => fail_hard(),
         }
     }
 
@@ -477,7 +515,7 @@ impl TypeIR {
         use self::WireKind::*;
         match self.wire_kind {
             FlaggedTrue if self.with_option => quote!(bool),
-            _ => self.clone().with_deserialize_output().unboxed(),
+            _ => self.boxed(),
         }
     }
 
@@ -586,7 +624,6 @@ impl Constructor {
         }
         self.fixup_fields(fixup_map);
         self.fixup_variant(fixup_map);
-        //println!("fixed up {:#?}", self);
     }
 
     fn fixup_output(&mut self) {
@@ -728,11 +765,9 @@ impl Constructor {
         if self.type_parameters.is_empty() {
             return quote!();
         }
-        let tys1 = self.type_parameters.iter()
-            .map(|f| no_conflict_ident(f.name.as_ref().unwrap()))
-            .collect::<Vec<_>>();
-        let tys2 = tys1.clone();
-        quote! { <#(#tys1: ::Serialize<Input = #tys2>),*> }
+        let tys = self.type_parameters.iter()
+            .map(|f| no_conflict_ident(f.name.as_ref().unwrap()));
+        quote! { <#(#tys: ::BoxedSerialize),*> }
     }
 
     fn as_struct_determine_flags(&self, field_prefix: quote::Tokens) -> Option<(HashSet<syn::Ident>, quote::Tokens)> {
@@ -782,9 +817,9 @@ impl Constructor {
             let fields = self.fields.iter()
                 .filter_map(|f| {
                     let name = no_conflict_ident(f.name.as_ref().unwrap());
-                    let read_fish = f.ty.as_type().io_turbofish();
+                    let read_method = f.ty.as_type().as_read_method();
                     let mut expr = if flag_fields.contains(&name) {
-                        flags_to_read.push(quote!(#name = _de.read_generic #read_fish ()?;));
+                        flags_to_read.push(quote!(#name = _de. #read_method ()?;));
                         return None;
                     } else if let Some((flag_field, bit)) = f.ty.flag_field() {
                         let flag_field = no_conflict_ident(flag_field);
@@ -794,14 +829,14 @@ impl Constructor {
                         } else {
                             quote! {
                                 if #predicate {
-                                    Some(_de.read_generic #read_fish ()?)
+                                    Some(_de. #read_method ()?)
                                 } else {
                                     None
                                 }
                             }
                         }
                     } else {
-                        quote!(_de.read_generic #read_fish ()?)
+                        quote!(_de. #read_method ()?)
                     };
                     if !flags_to_read.is_empty() {
                         let read_flags = mem::replace(&mut flags_to_read, vec![]);
@@ -817,6 +852,23 @@ impl Constructor {
         (flag_fields, constructor)
     }
 
+    fn as_into_boxed(&self, name: &syn::Ident) -> Option<quote::Tokens> {
+        self.output.name()
+            .map(no_conflict_ident)
+            .and_then(|n| self.tl_id().map(|i| (n, i)))
+            .map(|(constructor, _)| {
+                let variant_name = self.variant_name();
+                quote! {
+                    impl ::IntoBoxed for #name {
+                        type Boxed = #constructor;
+                        fn into_boxed(self) -> #constructor {
+                            #constructor::#variant_name(self)
+                        }
+                    }
+                }
+            })
+    }
+
     fn as_type_struct_base(&self, name: syn::Ident) -> quote::Tokens {
         let serialize_destructure = self.as_variant_ref_destructure(&name)
             .map(|d| quote! { let &#d = self; })
@@ -826,16 +878,17 @@ impl Constructor {
         let flag_fields = &flag_fields_;
         let type_impl = self.as_type_impl(
             &name,
-            self.tl_id().unwrap_or_else(|| quote!(unimplemented!())),
             quote!(#serialize_destructure #serialize_stmts Ok(())),
             Some(quote! {
                 #( let #flag_fields: i32; )*
                 Ok(#name #deserialize)
             }));
         let struct_block = self.as_struct_base(&name);
+        let into_boxed = self.as_into_boxed(&name);
         quote! {
             #struct_block
             #type_impl
+            #into_boxed
         }
     }
 
@@ -882,12 +935,10 @@ impl Constructor {
     }
 
     fn as_variant_serialize(&self) -> quote::Tokens {
-        println!("struct {:#?}", self);
         let (flag_fields, determine_flags) = self.as_struct_determine_flags(quote!())
             .unwrap_or_else(|| (HashSet::new(), quote!()));
         let fields = self.fields.iter()
             .map(|f| {
-                println!("variant {:#?}", f);
                 let name = f.name.as_ref().unwrap();
                 let field_name = no_conflict_ident(name);
                 let local_name = no_conflict_local_ident(name).unwrap_or_else(|| field_name.clone());
@@ -895,21 +946,21 @@ impl Constructor {
                 if ty.is_unit() {
                     return quote!();
                 }
-                let write_fish = ty.io_turbofish();
+                let write_method = ty.as_write_method();
                 if flag_fields.contains(&field_name) {
-                    quote! { _ser.write_generic #write_fish (&#local_name)?; }
+                    quote! { _ser. #write_method (&#local_name)?; }
                 } else if f.ty.flag_field().is_some() {
                     let outer_ref = ty.reference_prefix();
                     let inner_ref = ty.ref_prefix();
                     let local_ref = ty.local_reference_prefix();
                     quote! {
                         if let #outer_ref Some(#inner_ref inner) = #local_name {
-                            _ser.write_generic #write_fish (#local_ref inner)?;
+                            _ser. #write_method (#local_ref inner)?;
                         }
                     }
                 } else {
                     let prefix = ty.local_reference_prefix();
-                    quote! { _ser.write_generic #write_fish (#prefix #local_name)?; }
+                    quote! { _ser. #write_method (#prefix #local_name)?; }
                 }
             });
         quote! {
@@ -933,7 +984,6 @@ impl Constructor {
         let serialize_stmts = self.as_variant_serialize();
         let type_impl = self.as_type_impl(
             &name,
-            self.tl_id().unwrap_or_else(|| quote!(unimplemented!())),
             quote!(#serialize_destructure #serialize_stmts Ok(())),
             None);
         quote! {
@@ -955,11 +1005,11 @@ impl Constructor {
     }
 
     fn as_variant_serialize_arm(&self) -> quote::Tokens {
+        let tl_id = self.tl_id().unwrap_or_else(|| quote!(unimplemented!()));
         if self.fields.is_empty() {
-            quote!(=> Ok(()))
+            quote!(=> (#tl_id, &()))
         } else {
-            let write_fish = self.variant.as_type().io_turbofish();
-            quote!((ref x) => _ser.write_generic #write_fish (x))
+            quote!((ref x) => (#tl_id, x))
         }
     }
 
@@ -967,8 +1017,8 @@ impl Constructor {
         if self.fields.is_empty() {
             quote!()
         } else {
-            let read_fish = self.variant.as_type().io_turbofish();
-            quote!((_de.read_generic #read_fish ()?))
+            let read_method = self.variant.as_type().as_read_method();
+            quote!((_de. #read_method ()?))
         }
     }
 
@@ -990,26 +1040,19 @@ impl Constructor {
         })
     }
 
-    fn as_type_impl(&self, name: &syn::Ident, type_id: quote::Tokens, serialize: quote::Tokens, deserialize: Option<quote::Tokens>) -> quote::Tokens {
+    fn as_type_impl(&self, name: &syn::Ident, serialize: quote::Tokens, deserialize: Option<quote::Tokens>) -> quote::Tokens {
         let serialize_generics = self.serialize_generics();
         let ty = self.as_variant_generic_type();
-        let io_fish = ty.io_turbofish();
+        let write_method = ty.as_write_method();
+        let self_type = ty.boxed();
         let generics = self.generics();
 
         let deserialize = deserialize.map(|body| {
-            let boxed_deserialize_generics = self.type_generics(&quote!(::BoxedDeserialize));
-            let deserialize_generics = self.type_generics(&quote!(::Deserialize));
+            let bare_deserialize_generics = self.type_generics(&quote!(::BareDeserialize));
             quote! {
-                impl #boxed_deserialize_generics ::BoxedDeserialize for #name #generics {
-                    fn deserialize_boxed(_id: ::ConstructorNumber, _de: &mut ::Deserializer) -> ::Result<Self> {
+                impl #bare_deserialize_generics ::BareDeserialize for #name #generics {
+                    fn deserialize_bare(_de: &mut ::Deserializer) -> ::Result<Self> {
                         #body
-                    }
-                }
-
-                impl #deserialize_generics ::Deserialize for #name #generics {
-                    type Output = Self;
-                    fn deserialize(de: &mut ::Deserializer) -> ::Result<Self> {
-                        de.read_generic #io_fish ()
                     }
                 }
             }
@@ -1017,20 +1060,9 @@ impl Constructor {
 
         quote! {
 
-            impl #serialize_generics ::BoxedSerialize for #name #generics {
-                fn type_id(&self) -> ::ConstructorNumber {
-                    #type_id
-                }
-
-                fn serialize_boxed(&self, _ser: &mut ::Serializer) -> ::Result<()> {
+            impl #serialize_generics ::BareSerialize for #name #generics {
+                fn serialize_bare(&self, _ser: &mut ::Serializer) -> ::Result<()> {
                     #serialize
-                }
-            }
-
-            impl #serialize_generics ::Serialize for #name #generics {
-                type Input = Self;
-                fn serialize(obj: &Self::Input, ser: &mut ::Serializer) -> ::Result<()> {
-                    ser.write_generic #io_fish (obj)
                 }
             }
 
@@ -1125,37 +1157,22 @@ impl Constructors {
 
     fn as_type_impl(&self, name: &syn::Ident, type_id: quote::Tokens, serialize: quote::Tokens, deserialize: quote::Tokens) -> quote::Tokens {
         let self_type = self.0[0].output.as_type().boxed();
+        let tl_id_vec = self.as_tl_id_vec();
         quote! {
 
             impl ::BoxedSerialize for #name {
-                fn type_id(&self) -> ::ConstructorNumber {
-                    #type_id
-                }
-
-                fn serialize_boxed(&self, _ser: &mut ::Serializer) -> ::Result<()> {
+                fn serialize_boxed<'this>(&'this self) -> (::ConstructorNumber, &'this ::BareSerialize) {
                     #serialize
                 }
             }
 
-            impl ::Serialize for #name {
-                type Input = #self_type;
-                fn serialize(obj: &Self::Input, ser: &mut ::Serializer) -> ::Result<()> {
-                    unimplemented!()
-                }
-            }
-
             impl ::BoxedDeserialize for #name {
+                fn possible_constructors() -> Vec<::ConstructorNumber> { #tl_id_vec }
                 fn deserialize_boxed(_id: ::ConstructorNumber, _de: &mut ::Deserializer) -> ::Result<Self> {
                     #deserialize
                 }
             }
 
-            impl ::Deserialize for #name {
-                type Output = #self_type;
-                fn deserialize(de: &mut ::Deserializer) -> ::Result<Self::Output> {
-                    unimplemented!()
-                }
-            }
         }
     }
 
@@ -1188,9 +1205,13 @@ impl Constructors {
         }
     }
 
-    fn as_deserialize_match(&self, enum_name: &syn::Ident) -> quote::Tokens {
+    fn as_tl_id_vec(&self) -> quote::Tokens {
         let tl_ids = self.0.iter()
             .map(|c| c.tl_id());
+        quote!(vec![#( #tl_ids ),*])
+    }
+
+    fn as_deserialize_match(&self, enum_name: &syn::Ident) -> quote::Tokens {
         let constructors = self.0.iter()
             .filter(|c| c.tl_id().is_some())
             .map(|c| {
@@ -1202,7 +1223,7 @@ impl Constructors {
         quote! {
             match _id {
                 #( #constructors, )*
-                id => Err(::error::ErrorKind::InvalidType(vec![#( #tl_ids ),*], id).into()),
+                id => Err(::error::ErrorKind::InvalidType(Self::possible_constructors(), id).into()),
             }
         }
     }
@@ -1262,7 +1283,6 @@ fn make_fixup_map(constructors: &AllConstructors) -> TypeFixupMap {
         .flat_map(|(ns, constructor_map)| {
             constructor_map.iter().flat_map(move |(output, constructors)| {
                 constructors.0.iter().filter_map(move |constructor| {
-                    //println!("cons {:#?}", constructor);
                     let variant_name = match constructor.variant {
                         Type::Named(ref n) => n,
                         _ => return None,
