@@ -79,6 +79,7 @@ pub mod parser {
         pub type_parameters: Vec<Field>,
         pub fields: Vec<Field>,
         pub output: Type,
+        pub matched: String,
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -174,14 +175,20 @@ pub mod parser {
             + base_fields()
     }
 
+    fn output_and_matched<T: 'static>(inner: Parser<u8, T>) -> Parser<u8, (String, T)> {
+        Parser::new(move |input| {
+            let start = input.position();
+            let output = inner.parse(input)?;
+            let end = input.position();
+            Ok((utf8(input.segment(start, end)), output))
+        })
+    }
+
     fn constructor() -> Parser<u8, Constructor> {
-        (dotted_ident() + tl_id().opt() + fields() - seq(b" = ") + ty_space_generic() - sym(b';'))
-            .map(|(((variant, tl_id), (type_parameters, fields)), output)| Constructor {
+        output_and_matched(dotted_ident() + tl_id().opt() + fields() - seq(b" = ") + ty_space_generic() - sym(b';'))
+            .map(|(matched, (((variant, tl_id), (type_parameters, fields)), output))| Constructor {
+                tl_id, type_parameters, fields, output, matched,
                 variant: Type::Named(variant),
-                tl_id: tl_id,
-                type_parameters: type_parameters,
-                fields: fields,
-                output: output,
             })
             .name("constructor")
     }
@@ -798,11 +805,17 @@ impl Constructor {
         Some((flag_fields, determination))
     }
 
+    fn as_struct_doc(&self, name: &syn::Ident) -> String {
+        format!("TL-derived struct `{}`\n\n```text\n{}\n```\n", name, self.matched)
+    }
+
     fn as_struct_base(&self, name: &syn::Ident) -> quote::Tokens {
+        let doc = self.as_struct_doc(name);
         let generics = self.generics();
         let fields = self.fields_tokens(quote! {pub}, quote! {;});
         quote! {
             #[derive(Debug, Clone)]
+            #[doc = #doc]
             pub struct #name #generics #fields
         }
     }
@@ -1228,6 +1241,19 @@ impl Constructors {
         }
     }
 
+    fn as_enum_doc(&self, name: &syn::Ident) -> String {
+        use std::fmt::Write;
+        let mut ret = format!("TL-derived struct `{}`\n\n```text\n", name);
+        for (e, c) in self.0.iter().enumerate() {
+            if e != 0 {
+                ret.write_str("\n\n").unwrap();
+            }
+            ret.write_str(&c.matched).unwrap();
+        }
+        write!(ret, "\n```\n").unwrap();
+        ret
+    }
+
     fn as_structs(&self) -> quote::Tokens {
         // if self.0.len() == 1 {
         //     return self.0[0].as_single_type_struct();
@@ -1243,6 +1269,7 @@ impl Constructors {
         }
 
         let name = self.0[0].output.name().map(|n| no_conflict_ident(n)).unwrap();
+        let doc = self.as_enum_doc(&name);
         let variants = self.0.iter()
             .map(Constructor::as_variant);
         let methods = self.determine_methods(&name);
@@ -1254,6 +1281,7 @@ impl Constructors {
 
         quote! {
             #[derive(Debug, Clone)]
+            #[doc = #doc]
             pub enum #name {
                 #( #variants , )*
             }
