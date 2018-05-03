@@ -24,25 +24,38 @@ pub mod parser {
     impl Type {
         pub fn names_vec(&self) -> Option<&Vec<String>> {
             use self::Type::*;
-            match self {
-                &Int |
-                &Flags |
-                &TypeParameter(..) |
-                &Flagged(..) |
-                &Repeated(..) => None,
-                &Named(ref v) |
-                &Generic(ref v, ..) => Some(v),
+            match *self {
+                Int |
+                Flags |
+                TypeParameter(..) |
+                Flagged(..) |
+                Repeated(..) => None,
+                Named(ref v) |
+                Generic(ref v, ..) => Some(v),
             }
         }
 
-        pub fn namespace(&self) -> Option<&str> {
-            self.names_vec().and_then(|v| {
-                match v.len() {
-                    1 => None,
-                    2 => v.first().map(String::as_str),
-                    _ => unimplemented!(),
-                }
-            })
+        pub fn names_vec_mut(&mut self) -> Option<&mut Vec<String>> {
+            use self::Type::*;
+            match *self {
+                Int |
+                Flags |
+                TypeParameter(..) |
+                Flagged(..) |
+                Repeated(..) => None,
+                Named(ref mut v) |
+                Generic(ref mut v, ..) => Some(v),
+            }
+        }
+
+        pub fn owned_names_vec(&self) -> Vec<String> {
+            self.names_vec().cloned().unwrap_or_else(Vec::new)
+        }
+
+        pub fn namespaces(&self) -> &[String] {
+            self.names_vec()
+                .map(|v| &v[..(v.len() - 1).max(0)])
+                .unwrap_or(&[])
         }
 
         pub fn name(&self) -> Option<&str> {
@@ -226,6 +239,54 @@ pub mod parser {
         let mut input = pom::DataInput::new(input.as_bytes());
         lines().parse(&mut input)
     }
+
+    fn lowercase() -> Parser<u8, String> {
+        is_a(|c: u8| c.is_ascii_lowercase() || c.is_ascii_digit()).repeat(1..).map(utf8)
+    }
+
+    fn uppercase() -> Parser<u8, String> {
+        is_a(|c: u8| c.is_ascii_uppercase() || c.is_ascii_digit()).repeat(1..).map(utf8)
+    }
+
+    fn underscore() -> Parser<u8, ()> {
+        sym(b'_').repeat(1..).discard()
+    }
+
+    fn mixed_case_ident() -> Parser<u8, Vec<String>> {
+        let latter = (
+            (underscore() * uppercase()) |
+            (underscore() * lowercase()) |
+            ((uppercase() + lowercase()) |
+             (underscore() * uppercase() + lowercase()))
+                .map(|(lhs, rhs)| lhs + &rhs) |
+            uppercase()
+        ).map(|mut s| {
+            s.make_ascii_lowercase();
+            s
+        });
+        (lowercase().opt() + latter.repeat(0..))
+            .map(|(c, mut cs)| {
+                cs.splice(..0, c);
+                cs
+            })
+    }
+
+    pub fn ident_to_snake_case(input: &str) -> Result<String, pom::Error> {
+        let mut input = pom::DataInput::new(input.as_bytes());
+        let v = mixed_case_ident().parse(&mut input)?;
+        Ok(v.join("_"))
+    }
+
+    pub fn ident_to_upper_camel_case(input: &str) -> Result<String, pom::Error> {
+        let mut input = pom::DataInput::new(input.as_bytes());
+        let v = mixed_case_ident().parse(&mut input)?;
+        let mut ret = String::new();
+        for mut segment in v {
+            ret.push(segment.as_bytes()[0].to_ascii_uppercase() as char);
+            ret.push_str(&segment[1..]);
+        }
+        Ok(ret)
+    }
 }
 
 pub use parser::{Constructor, Delimiter, Field, Item, Type};
@@ -241,9 +302,64 @@ fn fail_hard() -> quote::Tokens {
 struct Constructors(Vec<Constructor>);
 
 #[derive(Debug)]
+enum NamespaceItem {
+    AsEnum(Constructors),
+    AsVariant(Constructor),
+    AsFunction(Constructor),
+    AnotherNamespace(Namespace),
+}
+
+#[derive(Debug, Default)]
+struct Namespace(BTreeMap<String, NamespaceItem>);
+
+impl NamespaceItem {
+    fn as_tokens(&self, name: &str) -> quote::Tokens {
+        use self::NamespaceItem::*;
+        let name = no_conflict_ident(name);
+        match *self {
+            AsEnum(ref cs) => cs.as_enum(),
+            AsVariant(ref c) => c.as_variant_type_struct(),
+            AsFunction(ref c) => c.as_function_struct(),
+            AnotherNamespace(ref ns) => {
+                let inner = ns.as_tokens();
+                quote! { pub mod #name { #inner } }
+            },
+        }
+    }
+}
+
+impl Namespace {
+    fn descend_tree<'this>(&'this mut self, names: &[String]) -> &'this mut Namespace {
+        use self::NamespaceItem::*;
+        names.iter()
+            .fold(self, |ns, name| {
+                match {
+                    ns.0.entry(name.clone())
+                        .or_insert_with(|| AnotherNamespace(Default::default()))
+                } {
+                    &mut AnotherNamespace(ref mut ns) => ns,
+                    _ => panic!("duplicate namespace item {:?} {:?}", names, name),
+                }
+            })
+    }
+
+    fn insert(&mut self, mut names: Vec<String>, item: NamespaceItem) {
+        let leaf = names.pop().unwrap();
+        match self.descend_tree(&names).0.insert(leaf, item) {
+            None => (),
+            Some(_) => panic!("duplicate namespace item {:?}", names),
+        }
+    }
+
+    fn as_tokens(&self) -> quote::Tokens {
+        let items = self.0.iter().map(|(name, item)| item.as_tokens(name));
+        quote!(#( #items )*)
+    }
+}
+
+#[derive(Debug)]
 struct AllConstructors {
-    types: BTreeMap<Option<String>, BTreeMap<String, Constructors>>,
-    functions: BTreeMap<Option<String>, Vec<Constructor>>,
+    items: Namespace,
     layer: u32,
 }
 
@@ -263,33 +379,46 @@ fn filter_items(iv: &mut Vec<Item>) {
 }
 
 fn partition_by_delimiter_and_namespace(iv: Vec<Item>) -> AllConstructors {
+    use self::NamespaceItem::*;
     let mut current = Delimiter::Types;
     let mut ret = AllConstructors {
-        types: BTreeMap::new(),
-        functions: BTreeMap::new(),
+        items: Default::default(),
         layer: 0,
     };
+    let mut constructorses: BTreeMap<Vec<String>, Constructors> = BTreeMap::new();
     for i in iv {
         match i {
             Item::Delimiter(d) => current = d,
-            Item::Constructor(c) => {
+            Item::Constructor(mut c) => {
                 match current {
                     Delimiter::Types => {
-                        ret.types.entry(c.output.namespace().map(Into::into))
-                            .or_insert_with(Default::default)
-                            .entry(c.output.name().map(Into::into).unwrap())
+                        constructorses.entry(c.output.owned_names_vec())
                             .or_insert_with(Default::default)
                             .0.push(c);
                     },
                     Delimiter::Functions => {
-                        ret.functions.entry(c.variant.namespace().map(Into::into))
-                            .or_insert_with(Default::default)
-                            .push(c);
+                        let mut ns = c.variant.owned_names_vec();
+                        ns.insert(0, "rpc".to_string());
+                        c.fixup();
+                        ret.items.insert(ns, AsFunction(c));
                     },
                 }
             },
             Item::Layer(i) => ret.layer = i,
         }
+    }
+    for (_, mut cs) in constructorses {
+        cs.fixup();
+        let base_ns = cs.0[0].output.namespaces().to_vec();
+        for c in &mut cs.0 {
+            if let Some(variant) = c.variant.names_vec_mut() {
+                if !variant.starts_with(&base_ns) {
+                    variant.splice(..0, base_ns.iter().cloned());
+                }
+            }
+            ret.items.insert(c.variant.owned_names_vec(), AsVariant(c.clone()));
+        }
+        ret.items.insert(cs.0[0].output.owned_names_vec(), AsEnum(cs));
     }
     ret
 }
@@ -559,38 +688,29 @@ impl TypeIR {
 type TypeFixupMap = BTreeMap<Vec<String>, Vec<String>>;
 
 impl Field {
-    fn fixup(&mut self, fixup_map: &TypeFixupMap) {
+    fn fixup(&mut self) {
         let is_flag_field = self.name.as_ref().map(String::as_str) == Some("flags");
-        self.ty.fixup(fixup_map, is_flag_field);
+        self.ty.fixup(is_flag_field);
     }
 }
 
 impl Type {
-    fn fixup(&mut self, fixup_map: &TypeFixupMap, is_flag_field: bool) {
+    fn fixup(&mut self, is_flag_field: bool) {
         use Type::*;
-        let loc = match *self {
-            Named(ref mut names) => names,
-            Generic(ref mut container, ref mut ty) => {
-                ty.fixup(fixup_map, false);
-                container
+        match *self {
+            Generic(_, ref mut ty) => {
+                ty.fixup(false);
             },
             Flagged(_, _, ref mut ty) => {
-                ty.fixup(fixup_map, false);
-                return;
+                ty.fixup(false);
             },
             Int if is_flag_field => {
                 *self = Flags;
-                return;
             },
             Int => {
                 *self = Named(vec!["int".into()]);
-                return;
             },
-            _ => return,
-        };
-        match fixup_map.get(loc) {
-            Some(replacement) => loc.clone_from(replacement),
-            None => (),
+            _ => (),
         }
     }
 
@@ -625,12 +745,10 @@ impl Field {
 }
 
 impl Constructor {
-    fn fixup(&mut self, which: Delimiter, fixup_map: &TypeFixupMap) {
-        if which == Delimiter::Functions {
-            self.fixup_output();
-        }
-        self.fixup_fields(fixup_map);
-        self.fixup_variant(fixup_map);
+    fn fixup(&mut self) {
+        self.fixup_output();
+        self.fixup_fields();
+        self.fixup_variant();
     }
 
     fn fixup_output(&mut self) {
@@ -652,9 +770,9 @@ impl Constructor {
         false
     }
 
-    fn fixup_fields(&mut self, fixup_map: &TypeFixupMap) {
+    fn fixup_fields(&mut self) {
         for f in &mut self.fields {
-            f.fixup(fixup_map);
+            f.fixup();
         }
 
         match self.variant.name() {
@@ -678,13 +796,13 @@ impl Constructor {
         }
     }
 
-    fn fixup_variant(&mut self, fixup_map: &TypeFixupMap) {
+    fn fixup_variant(&mut self) {
         match self.variant.name() {
             // The 'updates' variant struct conflicts with the module.
             Some("updates") => {
                 self.variant = Type::Named(vec!["updates_".into()]);
             },
-            _ => self.variant.fixup(fixup_map, false),
+            _ => self.variant.fixup(false),
         }
     }
 
@@ -866,20 +984,19 @@ impl Constructor {
     }
 
     fn as_into_boxed(&self, name: &syn::Ident) -> Option<quote::Tokens> {
-        self.output.name()
-            .map(no_conflict_ident)
-            .and_then(|n| self.tl_id().map(|i| (n, i)))
-            .map(|(constructor, _)| {
-                let variant_name = self.variant_name();
-                quote! {
-                    impl ::IntoBoxed for #name {
-                        type Boxed = #constructor;
-                        fn into_boxed(self) -> #constructor {
-                            #constructor::#variant_name(self)
-                        }
-                    }
+        if self.tl_id().is_none() {
+            return None;
+        }
+        let constructor = self.output.as_type().unboxed();
+        let variant_name = self.variant_name();
+        Some(quote! {
+            impl ::IntoBoxed for #name {
+                type Boxed = #constructor;
+                fn into_boxed(self) -> #constructor {
+                    #constructor::#variant_name(self)
                 }
-            })
+            }
+        })
     }
 
     fn as_type_struct_base(&self, name: syn::Ident) -> quote::Tokens {
@@ -917,6 +1034,13 @@ impl Constructor {
 
     fn variant_name(&self) -> syn::Ident {
         self.variant.name().map(|n| no_conflict_ident(n)).unwrap()
+    }
+
+    fn function_name(&self) -> syn::Ident {
+        self.variant.name()
+            .and_then(|s| parser::ident_to_upper_camel_case(s).ok())
+            .map(|n| no_conflict_ident(&n))
+            .unwrap()
     }
 
     fn as_variant_type_struct(&self) -> quote::Tokens {
@@ -983,7 +1107,7 @@ impl Constructor {
     }
 
     fn as_function_struct(&self) -> quote::Tokens {
-        let name = self.variant_name();
+        let name = self.function_name();
         let rpc_generics = self.rpc_generics();
         let generics = self.generics();
         let struct_block = self.as_struct_base(&name);
@@ -1013,7 +1137,8 @@ impl Constructor {
         if self.fields.is_empty() {
             quote!(#name)
         } else {
-            quote!(#name(#name))
+            let type_name = self.variant.as_type().unboxed();
+            quote!(#name(#type_name))
         }
     }
 
@@ -1084,10 +1209,54 @@ impl Constructor {
     }
 }
 
+fn common_prefix_of<'a>(a: Option<&'a str>, b: &'a str) -> &'a str {
+    let a = match a {
+        None => return b,
+        Some(s) => s,
+    };
+    let ret = a.char_indices()
+        .zip(b.char_indices())
+        .skip_while(|&((_, c_a), (_, c_b))| c_a == c_b)
+        .next()
+        .map(|((e_a, _), (e_b, _))| {
+            assert_eq!(e_a, e_b);
+            &b[..e_a]
+        })
+        .unwrap_or(b);
+    let min_len = a.len().min(b.len()).min(ret.len());
+    &ret[..min_len]
+}
+
 impl Constructors {
-    fn fixup(&mut self, delim: Delimiter, fixup_map: &TypeFixupMap) {
+    fn fixup(&mut self) {
+        self.trim_common_prefixes();
         for c in &mut self.0 {
-            c.fixup(delim, fixup_map);
+            c.fixup();
+        }
+    }
+
+    fn trim_common_prefixes(&mut self) {
+        let common_prefix = match {
+            self.0.iter()
+                .filter_map(|c| c.variant.name())
+                .fold(None, |a, b| Some(common_prefix_of(a, b)))
+        } {
+            None | Some("") => return,
+            Some(s) => s.to_string(),
+        };
+        let common_module = parser::ident_to_snake_case(&common_prefix).unwrap();
+        for c in &mut self.0 {
+
+            let names = match c.variant {
+                Type::Named(ref mut v) => v,
+                _ => continue,
+            };
+            let last = match &names.pop().unwrap()[common_prefix.len()..] {
+                "" => "Base",
+                s => s,
+            }.to_string();
+            names.push(common_module.to_string());
+            names.push(last);
         }
     }
 
@@ -1254,21 +1423,14 @@ impl Constructors {
         ret
     }
 
-    fn as_structs(&self) -> quote::Tokens {
-        // if self.0.len() == 1 {
-        //     return self.0[0].as_single_type_struct();
-        // }
-
-        let structs = self.0.iter()
-            .map(Constructor::as_variant_type_struct);
-
-        if !self.0.iter().any(|c| c.tl_id().is_some()) {
-            return quote! {
-                #( #structs )*
-            };
-        }
-
-        let name = self.0[0].output.name().map(|n| no_conflict_ident(n)).unwrap();
+    fn as_enum(&self) -> quote::Tokens {
+        let name = self.0[0].output.name()
+            .map(|s| {
+                println!("enumifying {:?}", s);
+                let s = parser::ident_to_upper_camel_case(s).unwrap();
+                no_conflict_ident(&s)
+            })
+            .unwrap();
         let doc = self.as_enum_doc(&name);
         let variants = self.0.iter()
             .map(Constructor::as_variant);
@@ -1287,7 +1449,6 @@ impl Constructors {
             }
             #methods
             #type_impl
-            #( #structs )*
         }
     }
 
@@ -1307,41 +1468,41 @@ impl Constructors {
 fn make_fixup_map(constructors: &AllConstructors) -> TypeFixupMap {
     let mut variants_to_outputs: TypeFixupMap = Default::default();
 
-    let iter = constructors.types.iter()
-        .flat_map(|(ns, constructor_map)| {
-            constructor_map.iter().flat_map(move |(output, constructors)| {
-                constructors.0.iter().filter_map(move |constructor| {
-                    let variant_name = match constructor.variant {
-                        Type::Named(ref n) => n,
-                        _ => return None,
-                    };
-                    let mut full_output: Vec<String> = ns.iter().cloned().collect();
-                    full_output.extend(variant_name.last().cloned());
-                    Some((variant_name.clone(), full_output))
-                })
-            })
-        });
+    // let iter = constructors.items.iter()
+    //     .flat_map(|(ns, constructor_map)| {
+    //         constructor_map.iter().flat_map(move |(output, constructors)| {
+    //             constructors.0.iter().filter_map(move |constructor| {
+    //                 let variant_name = match constructor.variant {
+    //                     Type::Named(ref n) => n,
+    //                     _ => return None,
+    //                 };
+    //                 let mut full_output: Vec<String> = ns.iter().cloned().collect();
+    //                 full_output.extend(variant_name.last().cloned());
+    //                 Some((variant_name.clone(), full_output))
+    //             })
+    //         })
+    //     });
 
-    let iter = constructors.functions.iter()
-        .flat_map(|(ns, constructors)| {
-            constructors.iter().filter_map(move |constructor| {
-                let variant_name = match constructor.variant {
-                    Type::Named(ref n) => n,
-                    _ => return None,
-                };
-                let mut full_output: Vec<String> = vec!["rpc".into()];
-                full_output.extend(ns.iter().cloned());
-                full_output.extend(variant_name.last().cloned());
-                Some((variant_name.clone(), full_output))
-            })
-        })
-        .chain(iter);
+    // let iter = constructors.functions.iter()
+    //     .flat_map(|(ns, constructors)| {
+    //         constructors.iter().filter_map(move |constructor| {
+    //             let variant_name = match constructor.variant {
+    //                 Type::Named(ref n) => n,
+    //                 _ => return None,
+    //             };
+    //             let mut full_output: Vec<String> = vec!["rpc".into()];
+    //             full_output.extend(ns.iter().cloned());
+    //             full_output.extend(variant_name.last().cloned());
+    //             Some((variant_name.clone(), full_output))
+    //         })
+    //     })
+    //     .chain(iter);
 
-    for (k, v) in iter {
-        if let Some(old_value) = variants_to_outputs.insert(k, v) {
-            panic!("duplicated key/value (value: {:?})", old_value);
-        }
-    }
+    // for (k, v) in iter {
+    //     if let Some(old_value) = variants_to_outputs.insert(k, v) {
+    //         //panic!("duplicated key/value (value: {:?})", old_value);
+    //     }
+    // }
 
     variants_to_outputs
 }
@@ -1354,40 +1515,40 @@ pub fn generate_code_for(input: &str) -> String {
     };
 
     let layer = constructors.layer as i32;
-    let mut items = vec![quote! {
+    let prelude = quote! {
         #![allow(non_camel_case_types)]
         pub use mtproto_prelude::*;
 
         pub const LAYER: i32 = #layer;
-    }];
+    };
 
     let variants_to_outputs = make_fixup_map(&constructors);
 
-    let mut dynamic_ctors = vec![];
-    for (ns, mut constructor_map) in constructors.types {
-        dynamic_ctors.extend(
-            constructor_map.values().flat_map(Constructors::as_dynamic_ctors));
-        let substructs = constructor_map.values_mut()
-            .map(|c| {
-                c.fixup(Delimiter::Functions, &variants_to_outputs);
-                c.as_structs()
-            });
-        match ns {
-            None => items.extend(substructs),
-            Some(name) => {
-                let name = no_conflict_ident(name.as_str());
-                items.push(quote! {
-                    pub mod #name {
-                        #( #substructs )*
-                    }
-                });
-            },
-        }
-    }
+    // let mut dynamic_ctors = vec![];
+    // for (ns, mut constructor_map) in constructors.types {
+    //     dynamic_ctors.extend(
+    //         constructor_map.values().flat_map(Constructors::as_dynamic_ctors));
+    //     let substructs = constructor_map.values_mut()
+    //         .map(|c| {
+    //             c.fixup(Delimiter::Functions, &variants_to_outputs);
+    //             c.as_structs()
+    //         });
+    //     match ns {
+    //         None => items.extend(substructs),
+    //         Some(name) => {
+    //             let name = no_conflict_ident(name.as_str());
+    //             items.push(quote! {
+    //                 pub mod #name {
+    //                     #( #substructs )*
+    //                 }
+    //             });
+    //         },
+    //     }
+    // }
 
-    dynamic_ctors.sort_by(|t1, t2| (&t1.0, t1.1).cmp(&(&t2.0, t2.1)));
-    let dynamic_ctors = dynamic_ctors.into_iter()
-        .map(|t| t.2);
+    // dynamic_ctors.sort_by(|t1, t2| (&t1.0, t1.1).cmp(&(&t2.0, t2.1)));
+    // let dynamic_ctors = dynamic_ctors.into_iter()
+    //     .map(|t| t.2);
     // items.push(quote! {
     //     pub fn register_ctors<R: ::tl::parsing::Reader>(cstore: &mut ::tl::dynamic::TLCtorMap<R>) {
     //         cstore.add::<Vec<Object>>(::tl::VEC_TYPE_ID);
@@ -1395,31 +1556,36 @@ pub fn generate_code_for(input: &str) -> String {
     //     }
     // });
 
-    let mut rpc_items = vec![];
-    for (ns, mut substructs) in constructors.functions {
-        substructs.sort_by(|c1, c2| c1.variant.cmp(&c2.variant));
-        let substructs = substructs.into_iter()
-            .map(|mut c| {
-                c.fixup(Delimiter::Functions, &variants_to_outputs);
-                c.as_function_struct()
-            });
-        match ns {
-            None => rpc_items.extend(substructs),
-            Some(name) => {
-                let name = no_conflict_ident(name.as_str());
-                rpc_items.push(quote! {
-                    pub mod #name {
-                        #( #substructs )*
-                    }
-                });
-            },
-        }
-    }
-    items.push(quote! {
-        pub mod rpc {
-            #( #rpc_items )*
-        }
-    });
+    // let mut rpc_items = vec![];
+    // for (ns, mut substructs) in constructors.functions {
+    //     substructs.sort_by(|c1, c2| c1.variant.cmp(&c2.variant));
+    //     let substructs = substructs.into_iter()
+    //         .map(|mut c| {
+    //             c.fixup(Delimiter::Functions, &variants_to_outputs);
+    //             c.as_function_struct()
+    //         });
+    //     match ns {
+    //         None => rpc_items.extend(substructs),
+    //         Some(name) => {
+    //             let name = no_conflict_ident(name.as_str());
+    //             rpc_items.push(quote! {
+    //                 pub mod #name {
+    //                     #( #substructs )*
+    //                 }
+    //             });
+    //         },
+    //     }
+    // }
+    // items.push(quote! {
+    //     pub mod rpc {
+    //         #( #rpc_items )*
+    //     }
+    // });
 
-    (quote! { #(#items)* }).to_string()
+    let items = constructors.items.as_tokens();
+
+    quote!(
+        #prelude
+        #items
+    ).to_string()
 }
