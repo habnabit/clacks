@@ -1,8 +1,8 @@
 #![recursion_limit = "128"]
 
+#[macro_use] extern crate derivative;
+#[macro_use] extern crate quote;
 extern crate pom;
-#[macro_use]
-extern crate quote;
 extern crate syn;
 
 pub mod parser {
@@ -86,13 +86,12 @@ pub mod parser {
     }
 
     #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-    pub struct Constructor {
-        pub variant: Type,
+    pub struct Constructor<Ty, Fi> {
+        pub variant: Ty,
         pub tl_id: Option<u32>,
-        pub type_parameters: Vec<Field>,
-        pub fields: Vec<Field>,
-        pub output: Type,
-        pub matched: String,
+        pub type_parameters: Vec<Fi>,
+        pub fields: Vec<Fi>,
+        pub output: Ty,
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -104,9 +103,12 @@ pub mod parser {
     #[derive(Debug, Clone)]
     pub enum Item {
         Delimiter(Delimiter),
-        Constructor(Constructor),
+        Constructor(Constructor<Type, Field>),
         Layer(u32),
     }
+
+    #[derive(Debug, Clone)]
+    pub struct Matched<T>(pub T, pub String);
 
     fn utf8(v: Vec<u8>) -> String {
         String::from_utf8(v).unwrap()
@@ -188,19 +190,19 @@ pub mod parser {
             + base_fields()
     }
 
-    fn output_and_matched<T: 'static>(inner: Parser<u8, T>) -> Parser<u8, (String, T)> {
+    fn output_and_matched<T: 'static>(inner: Parser<u8, T>) -> Parser<u8, Matched<T>> {
         Parser::new(move |input| {
             let start = input.position();
             let output = inner.parse(input)?;
             let end = input.position();
-            Ok((utf8(input.segment(start, end)), output))
+            Ok(Matched(output, utf8(input.segment(start, end))))
         })
     }
 
-    fn constructor() -> Parser<u8, Constructor> {
-        output_and_matched(dotted_ident() + tl_id().opt() + fields() - seq(b" = ") + ty_space_generic() - sym(b';'))
-            .map(|(matched, (((variant, tl_id), (type_parameters, fields)), output))| Constructor {
-                tl_id, type_parameters, fields, output, matched,
+    fn constructor() -> Parser<u8, Constructor<Type, Field>> {
+        (dotted_ident() + tl_id().opt() + fields() - seq(b" = ") + ty_space_generic() - sym(b';'))
+            .map(|(((variant, tl_id), (type_parameters, fields)), output)| Constructor {
+                tl_id, type_parameters, fields, output,
                 variant: Type::Named(variant),
             })
             .name("constructor")
@@ -224,18 +226,19 @@ pub mod parser {
         ).repeat(0..).discard()
     }
 
-    fn item() -> Parser<u8, Item> {
-        ( delimiter().map(Item::Delimiter) |
-          constructor().map(Item::Constructor) |
-          layer().map(Item::Layer)
-        ) - space()
+    fn item() -> Parser<u8, Matched<Item>> {
+        output_and_matched({
+            delimiter().map(Item::Delimiter) |
+            constructor().map(Item::Constructor) |
+            layer().map(Item::Layer)
+        }) - space()
     }
 
-    fn lines() -> Parser<u8, Vec<Item>> {
+    fn lines() -> Parser<u8, Vec<Matched<Item>>> {
         space() * item().repeat(0..) - end()
     }
 
-    pub fn parse_string(input: &str) -> Result<Vec<Item>, pom::Error> {
+    pub fn parse_string(input: &str) -> Result<Vec<Matched<Item>>, pom::Error> {
         let mut input = pom::DataInput::new(input.as_bytes());
         lines().parse(&mut input)
     }
@@ -289,7 +292,7 @@ pub mod parser {
     }
 }
 
-pub use parser::{Constructor, Delimiter, Field, Item, Type};
+pub use parser::{Constructor, Delimiter, Field, Item, Matched, Type};
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::mem;
@@ -298,24 +301,26 @@ fn fail_hard() -> quote::Tokens {
     quote!(FAIL_LOUDLY_AT_COMPILE_TIME!())
 }
 
-#[derive(Debug, Default)]
-struct Constructors(Vec<Constructor>);
+#[derive(Derivative)]
+#[derivative(Debug, Default(bound = ""))]
+struct Constructors<Ty, Fi>(Vec<Constructor<Ty, Fi>>);
+
+type TypeResolutionMap = BTreeMap<Vec<String>, TypeIR>;
 
 #[derive(Debug)]
 enum NamespaceItem {
-    AsEnum(Constructors),
-    AsVariant(Constructor),
-    AsFunction(Constructor),
+    AsEnum(Constructors<TypeIR, FieldIR>),
+    AsVariant(Constructor<TypeIR, FieldIR>),
+    AsFunction(Constructor<TypeIR, FieldIR>),
     AnotherNamespace(Namespace),
 }
 
 #[derive(Debug, Default)]
-struct Namespace(BTreeMap<String, NamespaceItem>);
+struct Namespace(BTreeMap<syn::Ident, NamespaceItem>);
 
 impl NamespaceItem {
-    fn as_tokens(&self, name: &str) -> quote::Tokens {
+    fn as_tokens(&self, name: &syn::Ident) -> quote::Tokens {
         use self::NamespaceItem::*;
-        let name = no_conflict_ident(name);
         match *self {
             AsEnum(ref cs) => cs.as_enum(),
             AsVariant(ref c) => c.as_variant_type_struct(),
@@ -329,7 +334,7 @@ impl NamespaceItem {
 }
 
 impl Namespace {
-    fn descend_tree<'this>(&'this mut self, names: &[String]) -> &'this mut Namespace {
+    fn descend_tree<'this>(&'this mut self, names: &[syn::Ident]) -> &'this mut Self {
         use self::NamespaceItem::*;
         names.iter()
             .fold(self, |ns, name| {
@@ -343,7 +348,7 @@ impl Namespace {
             })
     }
 
-    fn insert(&mut self, mut names: Vec<String>, item: NamespaceItem) {
+    fn insert(&mut self, mut names: Vec<syn::Ident>, item: NamespaceItem) {
         let leaf = names.pop().unwrap();
         match self.descend_tree(&names).0.insert(leaf, item) {
             None => (),
@@ -363,8 +368,8 @@ struct AllConstructors {
     layer: u32,
 }
 
-fn filter_items(iv: &mut Vec<Item>) {
-    iv.retain(|i| {
+fn filter_items(iv: &mut Vec<Matched<Item>>) {
+    iv.retain(|&Matched(ref i, _)| {
         let c = match i {
             &Item::Constructor(ref c) => c,
             _ => return true,
@@ -378,15 +383,16 @@ fn filter_items(iv: &mut Vec<Item>) {
     });
 }
 
-fn partition_by_delimiter_and_namespace(iv: Vec<Item>) -> AllConstructors {
+fn partition_by_delimiter_and_namespace(iv: Vec<Matched<Item>>) -> AllConstructors {
     use self::NamespaceItem::*;
     let mut current = Delimiter::Types;
     let mut ret = AllConstructors {
         items: Default::default(),
         layer: 0,
     };
-    let mut constructorses: BTreeMap<Vec<String>, Constructors> = BTreeMap::new();
-    for i in iv {
+    let mut constructorses: BTreeMap<Vec<String>, Constructors<Type, Field>> = BTreeMap::new();
+    let mut functions: Vec<Constructor<Type, Field>> = Vec::new();
+    for Matched(i, _) in iv {
         match i {
             Item::Delimiter(d) => current = d,
             Item::Constructor(mut c) => {
@@ -396,29 +402,27 @@ fn partition_by_delimiter_and_namespace(iv: Vec<Item>) -> AllConstructors {
                             .or_insert_with(Default::default)
                             .0.push(c);
                     },
-                    Delimiter::Functions => {
-                        let mut ns = c.variant.owned_names_vec();
-                        ns.insert(0, "rpc".to_string());
-                        c.fixup();
-                        ret.items.insert(ns, AsFunction(c));
-                    },
+                    Delimiter::Functions => functions.push(c),
                 }
             },
             Item::Layer(i) => ret.layer = i,
         }
     }
+    let mut resolve_map: TypeResolutionMap = Default::default();
     for (_, mut cs) in constructorses {
-        cs.fixup();
         let base_ns = cs.0[0].output.namespaces().to_vec();
+        cs.trim_common_prefixes(&base_ns, &mut resolve_map);
+        let mut cs = cs.resolve(&resolve_map);
         for c in &mut cs.0 {
-            if let Some(variant) = c.variant.names_vec_mut() {
-                if !variant.starts_with(&base_ns) {
-                    variant.splice(..0, base_ns.iter().cloned());
-                }
-            }
             ret.items.insert(c.variant.owned_names_vec(), AsVariant(c.clone()));
         }
         ret.items.insert(cs.0[0].output.owned_names_vec(), AsEnum(cs));
+    }
+    for c in functions {
+        let c = c.resolve(Delimiter::Functions, &resolve_map);
+        let mut ns = c.variant.owned_names_vec();
+        ns.insert(0, no_conflict_ident("rpc"));
+        ret.items.insert(ns, AsFunction(c));
     }
     ret
 }
@@ -464,21 +468,50 @@ fn lift_option_value(value: &Option<quote::Tokens>) -> quote::Tokens {
 }
 
 #[derive(Debug, Clone)]
-enum WireKind {
-    Bare(quote::Tokens),
-    Boxed(quote::Tokens),
-    TypeParameter(quote::Tokens),
-    FlaggedTrue,
-    Flags,
+struct TypeName {
+    tokens: quote::Tokens,
+    idents: Option<Vec<syn::Ident>>,
 }
 
-fn names_to_path_tokens(names: &[String]) -> quote::Tokens {
-    let mut ret = quote!(::mtproto);
-    for segment in names {
-        let segment = no_conflict_ident(segment);
-        ret = quote!(#ret::#segment);
+impl TypeName {
+    fn transformed_tokens<F>(&self, func: F) -> quote::Tokens
+        where F: FnOnce(&quote::Tokens) -> quote::Tokens,
+    {
+        func(&self.tokens)
     }
-    ret
+
+    fn transformed<F>(&self, func: F) -> Self
+        where F: FnOnce(&quote::Tokens) -> quote::Tokens,
+    {
+        let tokens = self.transformed_tokens(func);
+        TypeName { tokens, idents: None }
+    }
+}
+
+impl<S> ::std::iter::FromIterator<S> for TypeName
+    where S: AsRef<str>
+{
+    fn from_iter<T>(iter: T) -> Self
+        where T: IntoIterator<Item = S>,
+    {
+        let mut tokens = quote!(::mtproto);
+        let mut idents = vec![];
+        for segment in iter {
+            let segment = no_conflict_ident(segment.as_ref());
+            tokens = quote!(#tokens::#segment);
+            idents.push(segment);
+        }
+        TypeName { tokens, idents: Some(idents) }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum WireKind {
+    Bare(TypeName),
+    Boxed(TypeName),
+    TypeParameter(syn::Ident),
+    FlaggedTrue,
+    Flags,
 }
 
 fn is_first_char_lowercase(s: &str) -> bool {
@@ -488,20 +521,20 @@ fn is_first_char_lowercase(s: &str) -> bool {
 }
 
 impl WireKind {
-    fn from_names(names: &[String]) -> Self {
+    fn from_names_and_hint(names: &[String], force_bare: bool) -> Self {
         use self::WireKind::*;
         match names.last().map(String::as_str) {
             Some("true") => FlaggedTrue,
-            Some(s) if is_first_char_lowercase(s) =>
-                Bare(names_to_path_tokens(names)),
-            Some(s) => Boxed(names_to_path_tokens(names)),
+            Some(s) if force_bare || is_first_char_lowercase(s) =>
+                Bare(names.iter().map(String::as_str).collect()),
+            Some(s) =>
+                Boxed(names.iter().map(String::as_str).collect()),
             None => unimplemented!(),
         }
     }
 
-    fn type_parameter(name: &str) -> Self {
-        let id = no_conflict_ident(name);
-        WireKind::TypeParameter(quote! { #id })
+    fn type_parameter(id: syn::Ident) -> Self {
+        WireKind::TypeParameter(id)
     }
 
     fn become_container_for(&mut self, include_determiner: bool, contained: Self) {
@@ -513,19 +546,19 @@ impl WireKind {
         };
         let contained = if include_determiner {
             match contained {
-                Bare(t) => quote!(::mtproto::Bare, #t),
-                Boxed(t) |
+                Bare(ty) => ty.transformed_tokens(|t| quote!(::mtproto::Bare, #t)),
+                Boxed(ty) => ty.transformed_tokens(|t| quote!(::mtproto::Boxed, #t)),
                 TypeParameter(t) => quote!(::mtproto::Boxed, #t),
                 _ => unimplemented!(),
             }
         } else {
             match contained {
-                Bare(t) | Boxed(t) | TypeParameter(t) => t,
+                Bare(t) | Boxed(t) => t.tokens,
+                TypeParameter(t) => quote!(#t),
                 _ => unimplemented!(),
             }
         };
-        let ty = ty_loc.clone();
-        *ty_loc = quote!(#ty<#contained>);
+        *ty_loc = ty_loc.transformed(|ty| quote!(#ty<#contained>));
     }
 
     fn as_read_method(&self) -> quote::Tokens {
@@ -545,6 +578,39 @@ impl WireKind {
             FlaggedTrue => fail_hard(),
         }
     }
+
+    fn is_unit(&self) -> bool {
+        use self::WireKind::*;
+        match *self {
+            FlaggedTrue => true,
+            _ => false,
+        }
+    }
+
+    fn is_flags(&self) -> bool {
+        use self::WireKind::*;
+        match *self {
+            Flags => true,
+            _ => false,
+        }
+    }
+
+    fn is_type_parameter(&self) -> bool {
+        use self::WireKind::*;
+        match *self {
+            TypeParameter(..) => true,
+            _ => false,
+        }
+    }
+
+    fn opt_names_slice(&self) -> Option<&[syn::Ident]> {
+        use self::WireKind::*;
+        match *self {
+            Bare(ref t) |
+            Boxed(ref t) => t.idents.as_ref().map(|v| v.as_slice()),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -557,7 +623,11 @@ struct TypeIR {
 
 impl TypeIR {
     fn from_names(names: &[String]) -> Self {
-        let wire_kind = WireKind::from_names(names);
+        Self::from_names_and_hint(names, false)
+    }
+
+    fn from_names_and_hint(names: &[String], force_bare: bool) -> Self {
+        let wire_kind = WireKind::from_names_and_hint(names, force_bare);
         TypeIR {
             wire_kind, with_option: false,
             needs_box: match names.last().map(String::as_str) {
@@ -574,9 +644,27 @@ impl TypeIR {
         }
     }
 
-    fn type_parameter(name: &str) -> Self {
+    fn bytes() -> Self {
         TypeIR {
-            wire_kind: WireKind::type_parameter(name),
+            wire_kind: WireKind::Bare(["bytes"].iter().collect()),
+            needs_box: false,
+            needs_determiner: false,
+            with_option: false,
+        }
+    }
+
+    fn int() -> Self {
+        TypeIR {
+            wire_kind: WireKind::Bare(["int"].iter().collect()),
+            needs_box: false,
+            needs_determiner: false,
+            with_option: false,
+        }
+    }
+
+    fn type_parameter(id: syn::Ident) -> Self {
+        TypeIR {
+            wire_kind: WireKind::type_parameter(id),
             needs_box: false,
             needs_determiner: false,
             with_option: false,
@@ -630,7 +718,8 @@ impl TypeIR {
     fn non_field_type(&self) -> quote::Tokens {
         use self::WireKind::*;
         match self.wire_kind {
-            Bare(ref t) | Boxed(ref t) | TypeParameter(ref t) => t.clone(),
+            Bare(ref t) | Boxed(ref t) => t.tokens.clone(),
+            TypeParameter(ref t) => quote!(#t),
             _ => fail_hard(),
         }
     }
@@ -677,66 +766,67 @@ impl TypeIR {
     }
 
     fn is_unit(&self) -> bool {
-        use self::WireKind::*;
-        match self.wire_kind {
-            FlaggedTrue => true,
-            _ => false,
-        }
+        self.wire_kind.is_unit()
+    }
+
+    fn is_flags(&self) -> bool {
+        self.wire_kind.is_flags()
+    }
+
+    fn is_type_parameter(&self) -> bool {
+        self.wire_kind.is_type_parameter()
+    }
+
+    fn owned_names_vec(&self) -> Vec<syn::Ident> {
+        self.wire_kind.opt_names_slice()
+            .unwrap()
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    fn name(&self) -> syn::Ident {
+        self.wire_kind.opt_names_slice()
+            .and_then(|s| s.last())
+            .unwrap()
+            .clone()
     }
 }
 
-type TypeFixupMap = BTreeMap<Vec<String>, Vec<String>>;
-
-impl Field {
-    fn fixup(&mut self) {
-        let is_flag_field = self.name.as_ref().map(String::as_str) == Some("flags");
-        self.ty.fixup(is_flag_field);
-    }
-}
-
-impl Type {
-    fn fixup(&mut self, is_flag_field: bool) {
-        use Type::*;
-        match *self {
-            Generic(_, ref mut ty) => {
-                ty.fixup(false);
-            },
-            Flagged(_, _, ref mut ty) => {
-                ty.fixup(false);
-            },
-            Int if is_flag_field => {
-                *self = Flags;
-            },
-            Int => {
-                *self = Named(vec!["int".into()]);
-            },
-            _ => (),
-        }
-    }
-
-    fn as_type(&self) -> TypeIR {
-        use Type::*;
-        match self {
-            &Named(ref v) => TypeIR::from_names(v),
-            &TypeParameter(ref s) => TypeIR::type_parameter(s),
-            &Generic(ref container_name, ref ty) => {
-                let container = TypeIR::from_names(container_name);
-                ty.as_type().with_container(container)
-            },
-            &Flagged(_, _, ref ty) => {
-                ty.as_type().with_option_wrapper()
-            },
-            &Flags => TypeIR::flags(),
-            &Int |
-            &Repeated(..) => unimplemented!(),
-        }
-    }
+#[derive(Debug, Clone)]
+struct FieldIR {
+    name: String,
+    ty: TypeIR,
+    flag_bit: Option<u32>,
 }
 
 impl Field {
+    fn resolved(&self, resolve_map: &TypeResolutionMap, replace_string_with_bytes: bool) -> FieldIR {
+        let name = self.name.clone().unwrap();
+        let ty = match name.as_str() {
+            "flags" =>
+                self.ty.resolved(resolve_map, true),
+            "bytes" if replace_string_with_bytes =>
+                TypeIR::bytes(),
+            _ => self.ty.resolved(resolve_map, false),
+        };
+        let flag_bit = self.ty.flag_field().map(|(_, b)| b);
+        FieldIR { ty, name, flag_bit }
+    }
+}
+
+impl FieldIR {
+    fn name(&self) -> syn::Ident {
+        no_conflict_ident(&self.name)
+    }
+
+    fn local_name(&self) -> Option<syn::Ident> {
+        no_conflict_local_ident(&self.name)
+    }
+
     fn as_field(&self) -> quote::Tokens {
-        let name = self.name.as_ref().map(|n| no_conflict_ident(n)).unwrap();
-        let ty = self.ty.as_type().field_type();
+        let name = self.name();
+        let ty = self.ty.field_type();
 
         quote! {
             #name: #ty
@@ -744,16 +834,54 @@ impl Field {
     }
 }
 
-impl Constructor {
-    fn fixup(&mut self) {
-        self.fixup_output();
-        self.fixup_fields();
-        self.fixup_variant();
+impl Type {
+    fn resolved(&self, resolve_map: &TypeResolutionMap, is_flag_field: bool) -> TypeIR {
+        use Type::*;
+        match *self {
+            Named(ref names) => {
+                match resolve_map.get(names) {
+                    Some(ir) => return ir.clone(),
+                    None => TypeIR::from_names(names),
+                }
+            },
+            TypeParameter(ref name) => TypeIR::type_parameter(no_conflict_ident(name)),
+            Generic(ref container, ref ty) => {
+                let ty = ty.resolved(resolve_map, false);
+                let container = match resolve_map.get(container) {
+                    Some(ir) => ir.clone(),
+                    None => TypeIR::from_names(container),
+                };
+                ty.with_container(container)
+            },
+            Flagged(_, _, ref ty) => {
+                ty.resolved(resolve_map, false).with_option_wrapper()
+            },
+            Flags => TypeIR::flags(),
+            Int if is_flag_field => TypeIR::flags(),
+            Int => TypeIR::int(),
+            Repeated(..) => unimplemented!(),
+        }
+    }
+}
+
+impl Constructor<Type, Field> {
+    fn resolve(self, which: Delimiter, resolve_map: &TypeResolutionMap) -> Constructor<TypeIR, FieldIR> {
+        Constructor {
+            variant: self.variant.resolved(resolve_map, false),
+            fields: self.resolved_fields(resolve_map),
+            output: self.resolved_output(which, resolve_map),
+            type_parameters: self.type_parameters.iter()
+                .map(|t| t.resolved(resolve_map, false))
+                .collect(),
+            tl_id: self.tl_id,
+        }
     }
 
-    fn fixup_output(&mut self) {
-        if self.is_output_a_type_parameter() {
-            self.output = Type::TypeParameter(self.output.name().unwrap().into());
+    fn resolved_output(&self, which: Delimiter, resolve_map: &TypeResolutionMap) -> TypeIR {
+        if which == Delimiter::Functions && self.is_output_a_type_parameter() {
+            TypeIR::type_parameter(no_conflict_ident(self.output.name().unwrap()))
+        } else {
+            self.output.resolved(resolve_map, false)
         }
     }
 
@@ -770,84 +898,34 @@ impl Constructor {
         false
     }
 
-    fn fixup_fields(&mut self) {
-        for f in &mut self.fields {
-            f.fixup();
-        }
+    fn resolved_fields(&self, resolve_map: &TypeResolutionMap) -> Vec<FieldIR> {
+        let replace_string_with_bytes = match self.variant.name().unwrap_or("") {
+            "resPQ" |
+            "p_q_inner_data" |
+            "p_q_inner_data_temp" |
+            "server_DH_params_ok" |
+            "server_DH_inner_data" |
+            "client_DH_inner_data" |
+            "req_DH_params" |
+            "set_client_DH_params" => true,
+            _ => false,
+        };
 
-        match self.variant.name() {
-            Some("resPQ") |
-            Some("p_q_inner_data") |
-            Some("p_q_inner_data_temp") |
-            Some("server_DH_params_ok") |
-            Some("server_DH_inner_data") |
-            Some("client_DH_inner_data") |
-            Some("req_DH_params") |
-            Some("set_client_DH_params") => (),
-            _ => return,
-        }
-        for f in &mut self.fields {
-            match f.ty {
-                Type::Named(ref mut v) if v.len() == 1 && v[0] == "string" => {
-                    v[0] = "bytes".into();
-                },
-                _ => (),
-            }
-        }
-    }
-
-    fn fixup_variant(&mut self) {
-        match self.variant.name() {
-            // The 'updates' variant struct conflicts with the module.
-            Some("updates") => {
-                self.variant = Type::Named(vec!["updates_".into()]);
-            },
-            _ => self.variant.fixup(false),
-        }
-    }
-
-    fn flag_field_names(&self) -> HashSet<&str> {
-        let mut ret = HashSet::new();
-        for f in &self.fields {
-            match f.name {
-                Some(ref name) if f.ty == Type::Flags => {
-                    ret.insert(name.as_str());
-                }
-                _ => (),
-            }
-            if let Some((flag, _)) = f.ty.flag_field() {
-                ret.insert(flag);
-            }
-        }
-        ret
-    }
-
-    fn flag_field_idents(&self) -> HashSet<syn::Ident> {
-        self.flag_field_names()
-            .into_iter()
-            .map(no_conflict_ident)
+        self.fields.iter()
+            .map(|f| f.resolved(resolve_map, replace_string_with_bytes))
             .collect()
     }
+}
 
-    fn non_flag_fields<'a>(&'a self) -> Box<Iterator<Item = &'a Field> + 'a> {
-        let flag_fields = self.flag_field_names();
-        Box::new({
-            self.fields.iter()
-                .filter(move |f| {
-                    f.name.as_ref()
-                        .map(|s| !flag_fields.contains(s.as_str()))
-                        .unwrap_or(true)
-                })
-        })
-    }
-
+impl Constructor<TypeIR, FieldIR> {
     fn fields_tokens(&self, pub_: quote::Tokens, trailer: quote::Tokens) -> quote::Tokens {
         let pub_ = std::iter::repeat(pub_);
         if self.fields.is_empty() {
             quote! { #trailer }
         } else {
-            let fields = self.non_flag_fields()
-                .map(Field::as_field);
+            let fields = self.fields.iter()
+                .filter(|f| !f.ty.is_flags())
+                .map(FieldIR::as_field);
             quote! {
                 { #( #pub_ #fields , )* }
             }
@@ -867,8 +945,7 @@ impl Constructor {
         if self.type_parameters.is_empty() {
             return quote!();
         }
-        let tys = self.type_parameters.iter()
-            .map(|f| no_conflict_ident(f.name.as_ref().unwrap()));
+        let tys = self.type_parameters.iter().map(FieldIR::name);
         quote! { <#(#tys),*> }
     }
 
@@ -880,8 +957,7 @@ impl Constructor {
         if self.type_parameters.is_empty() {
             return quote!();
         }
-        let tys = self.type_parameters.iter()
-            .map(|f| no_conflict_ident(f.name.as_ref().unwrap()));
+        let tys = self.type_parameters.iter().map(FieldIR::name);
         let traits = std::iter::repeat(trait_);
         quote! { <#(#tys: #traits),*> }
     }
@@ -890,41 +966,39 @@ impl Constructor {
         if self.type_parameters.is_empty() {
             return quote!();
         }
-        let tys = self.type_parameters.iter()
-            .map(|f| no_conflict_ident(f.name.as_ref().unwrap()));
+        let tys = self.type_parameters.iter().map(FieldIR::name);
         quote! { <#(#tys: ::BoxedSerialize),*> }
     }
 
-    fn as_struct_determine_flags(&self, field_prefix: quote::Tokens) -> Option<(HashSet<syn::Ident>, quote::Tokens)> {
-        let flag_fields = self.flag_field_idents();
-        if flag_fields.is_empty() {
-            return None;
+    fn as_struct_determine_flags(&self, field_prefix: quote::Tokens) -> Option<quote::Tokens> {
+        match self.fields.iter().filter(|f| f.ty.is_flags()).count() {
+            0 => return None,
+            1 => (),
+            n => panic!("{} flags fields found on {:?}", n, self),
         }
         let determination = {
             let fields = self.fields.iter()
                 .filter_map(|f| {
-                    let name = no_conflict_ident(f.name.as_ref().unwrap());
-                    f.ty.flag_field().map(|(flag_field, bit)| {
-                        let flag_field = no_conflict_ident(flag_field);
-                        let is_defined = f.ty.as_type().is_defined_trailer();
+                    let name = f.name();
+                    f.flag_bit.map(|bit| {
+                        let is_defined = f.ty.is_defined_trailer();
                         quote! {
                             if #field_prefix #name #is_defined {
-                                #flag_field |= 1 << #bit;
+                                _flags |= 1 << #bit;
                             }
                         }
                     })
                 });
-            let flag_fields = &flag_fields;
             quote! {
-                #( let mut #flag_fields = 0i32; )*
+                let mut _flags = 0i32;
                 #( #fields )*
             }
         };
-        Some((flag_fields, determination))
+        Some(determination)
     }
 
     fn as_struct_doc(&self, name: &syn::Ident) -> String {
-        format!("TL-derived struct `{}`\n\n```text\n{}\n```\n", name, self.matched)
+        format!("TL-derived struct `{}`\n\n```text\n{}\n```\n", name, "")//self.matched)
     }
 
     fn as_struct_base(&self, name: &syn::Ident) -> quote::Tokens {
@@ -938,24 +1012,24 @@ impl Constructor {
         }
     }
 
-    fn as_struct_deserialize(&self) -> (HashSet<syn::Ident>, quote::Tokens) {
+    fn as_struct_deserialize(&self) -> (bool, quote::Tokens) {
         if self.fields.is_empty() {
-            return (HashSet::new(), quote!());
+            return (false, quote!());
         }
-        let flag_fields = self.flag_field_idents();
         let mut flags_to_read = vec![];
+        let mut has_flags = false;
         let constructor = {
             let fields = self.fields.iter()
                 .filter_map(|f| {
-                    let name = no_conflict_ident(f.name.as_ref().unwrap());
-                    let read_method = f.ty.as_type().as_read_method();
-                    let mut expr = if flag_fields.contains(&name) {
-                        flags_to_read.push(quote!(#name = _de. #read_method ()?;));
+                    let name = f.name();
+                    let read_method = f.ty.as_read_method();
+                    let mut expr = if f.ty.is_flags() {
+                        has_flags = true;
+                        flags_to_read.push(quote!(_flags = _de. #read_method ()?;));
                         return None;
-                    } else if let Some((flag_field, bit)) = f.ty.flag_field() {
-                        let flag_field = no_conflict_ident(flag_field);
-                        let predicate = quote!(#flag_field & (1 << #bit) != 0);
-                        if f.ty.as_type().is_unit() {
+                    } else if let Some(bit) = f.flag_bit {
+                        let predicate = quote!(_flags & (1 << #bit) != 0);
+                        if f.ty.is_unit() {
                             predicate
                         } else {
                             quote! {
@@ -980,14 +1054,14 @@ impl Constructor {
                 });
             quote!({ #( #fields, )* })
         };
-        (flag_fields, constructor)
+        (has_flags, constructor)
     }
 
     fn as_into_boxed(&self, name: &syn::Ident) -> Option<quote::Tokens> {
         if self.tl_id().is_none() {
             return None;
         }
-        let constructor = self.output.as_type().unboxed();
+        let constructor = self.output.unboxed();
         let variant_name = self.variant_name();
         Some(quote! {
             impl ::IntoBoxed for #name {
@@ -1004,13 +1078,17 @@ impl Constructor {
             .map(|d| quote! { let &#d = self; })
             .unwrap_or_else(|| quote!());
         let serialize_stmts = self.as_variant_serialize();
-        let (flag_fields_, deserialize) = self.as_struct_deserialize();
-        let flag_fields = &flag_fields_;
+        let (has_flags, deserialize) = self.as_struct_deserialize();
+        let flag_init = if has_flags {
+            quote! { let _flags: i32; }
+        } else {
+            quote!()
+        };
         let type_impl = self.as_type_impl(
             &name,
             quote!(#serialize_destructure #serialize_stmts Ok(())),
             Some(quote! {
-                #( let #flag_fields: i32; )*
+                #flag_init
                 Ok(#name #deserialize)
             }));
         let struct_block = self.as_struct_base(&name);
@@ -1024,7 +1102,7 @@ impl Constructor {
 
     fn as_single_type_struct(&self) -> quote::Tokens {
         let name = self.variant_name();
-        let output_name = self.output.name().map(|n| no_conflict_ident(n)).unwrap();
+        let output_name = self.output.name();
         let type_struct = self.as_type_struct_base(name);
         quote! {
             #type_struct
@@ -1033,14 +1111,7 @@ impl Constructor {
     }
 
     fn variant_name(&self) -> syn::Ident {
-        self.variant.name().map(|n| no_conflict_ident(n)).unwrap()
-    }
-
-    fn function_name(&self) -> syn::Ident {
         self.variant.name()
-            .and_then(|s| parser::ident_to_upper_camel_case(s).ok())
-            .map(|n| no_conflict_ident(&n))
-            .unwrap()
     }
 
     fn as_variant_type_struct(&self) -> quote::Tokens {
@@ -1055,12 +1126,12 @@ impl Constructor {
         if self.fields.is_empty() {
             return None;
         }
-        let fields = self.non_flag_fields()
+        let fields = self.fields.iter()
+            .filter(|f| !f.ty.is_flags())
             .map(|f| {
-                let prefix = f.ty.as_type().ref_prefix();
-                let name = f.name.as_ref().unwrap();
-                let field_name = no_conflict_ident(name);
-                if let Some(local_name) = no_conflict_local_ident(&name) {
+                let prefix = f.ty.ref_prefix();
+                let field_name = f.name();
+                if let Some(local_name) = f.local_name() {
                     quote! { #field_name: #prefix #local_name }
                 } else {
                     quote! { #prefix #field_name }
@@ -1072,31 +1143,29 @@ impl Constructor {
     }
 
     fn as_variant_serialize(&self) -> quote::Tokens {
-        let (flag_fields, determine_flags) = self.as_struct_determine_flags(quote!())
-            .unwrap_or_else(|| (HashSet::new(), quote!()));
+        let determine_flags = self.as_struct_determine_flags(quote!())
+            .unwrap_or_else(|| quote!());
         let fields = self.fields.iter()
             .map(|f| {
-                let name = f.name.as_ref().unwrap();
-                let field_name = no_conflict_ident(name);
-                let local_name = no_conflict_local_ident(name).unwrap_or_else(|| field_name.clone());
-                let ty = f.ty.as_type();
-                if ty.is_unit() {
+                if f.ty.is_unit() {
                     return quote!();
                 }
-                let write_method = ty.as_write_method();
-                if flag_fields.contains(&field_name) {
-                    quote! { _ser. #write_method (&#local_name)?; }
-                } else if f.ty.flag_field().is_some() {
-                    let outer_ref = ty.reference_prefix();
-                    let inner_ref = ty.ref_prefix();
-                    let local_ref = ty.local_reference_prefix();
+                let field_name = f.name();
+                let local_name = f.local_name().unwrap_or_else(|| field_name.clone());
+                let write_method = f.ty.as_write_method();
+                if f.ty.is_flags() {
+                    quote! { _ser. #write_method (&_flags)?; }
+                } else if f.flag_bit.is_some() {
+                    let outer_ref = f.ty.reference_prefix();
+                    let inner_ref = f.ty.ref_prefix();
+                    let local_ref = f.ty.local_reference_prefix();
                     quote! {
                         if let #outer_ref Some(#inner_ref inner) = #local_name {
                             _ser. #write_method (#local_ref inner)?;
                         }
                     }
                 } else {
-                    let prefix = ty.local_reference_prefix();
+                    let prefix = f.ty.local_reference_prefix();
                     quote! { _ser. #write_method (#prefix #local_name)?; }
                 }
             });
@@ -1107,11 +1176,11 @@ impl Constructor {
     }
 
     fn as_function_struct(&self) -> quote::Tokens {
-        let name = self.function_name();
+        let name = self.variant_name();
         let rpc_generics = self.rpc_generics();
         let generics = self.generics();
         let struct_block = self.as_struct_base(&name);
-        let mut output_ty = self.output.as_type().boxed();
+        let mut output_ty = self.output.boxed();
         if self.output.is_type_parameter() {
             output_ty = quote! {#output_ty::Reply};
         }
@@ -1137,13 +1206,13 @@ impl Constructor {
         if self.fields.is_empty() {
             quote!(#name)
         } else {
-            let type_name = self.variant.as_type().unboxed();
+            let type_name = self.variant.unboxed();
             quote!(#name(#type_name))
         }
     }
 
     fn as_variant_serialize_arm(&self) -> quote::Tokens {
-        let tl_id = self.tl_id().unwrap_or_else(|| quote!(unimplemented!()));
+        let tl_id = self.tl_id().unwrap();
         if self.fields.is_empty() {
             quote!(=> (#tl_id, &()))
         } else {
@@ -1155,17 +1224,17 @@ impl Constructor {
         if self.fields.is_empty() {
             quote!()
         } else {
-            let read_method = self.variant.as_type().as_read_method();
+            let read_method = self.variant.as_read_method();
             quote!((_de. #read_method ()?))
         }
     }
 
     fn as_variant_generic_type(&self) -> TypeIR {
-        let variant = self.variant.as_type();
-        match self.type_parameters.first().and_then(|f| f.name.as_ref()) {
+        let variant = self.variant.clone();
+        match self.type_parameters.first() {
             Some(param) => {
                 assert!(self.type_parameters.len() == 1);
-                TypeIR::type_parameter(param).with_container(variant)
+                TypeIR::type_parameter(param.name()).with_container(variant)
             },
             None => variant,
         }
@@ -1227,15 +1296,16 @@ fn common_prefix_of<'a>(a: Option<&'a str>, b: &'a str) -> &'a str {
     &ret[..min_len]
 }
 
-impl Constructors {
-    fn fixup(&mut self) {
-        self.trim_common_prefixes();
-        for c in &mut self.0 {
-            c.fixup();
-        }
+impl Constructors<Type, Field> {
+    fn resolve(self, resolve_map: &TypeResolutionMap) -> Constructors<TypeIR, FieldIR> {
+        Constructors({
+            self.0.into_iter()
+                .map(|c| c.resolve(Delimiter::Types, resolve_map))
+                .collect()
+        })
     }
 
-    fn trim_common_prefixes(&mut self) {
+    fn trim_common_prefixes(&mut self, base_ns: &[String], resolve_map: &mut TypeResolutionMap) {
         let common_prefix = match {
             self.0.iter()
                 .filter_map(|c| c.variant.name())
@@ -1247,36 +1317,54 @@ impl Constructors {
         let common_module = parser::ident_to_snake_case(&common_prefix).unwrap();
         for c in &mut self.0 {
 
-            let names = match c.variant {
-                Type::Named(ref mut v) => v,
-                _ => continue,
+            if let Some(variant) = c.variant.names_vec_mut() {
+                if !variant.starts_with(&base_ns) {
+                    variant.splice(..0, base_ns.iter().cloned());
+                }
+            }
+
+            let names = match c.variant.names_vec_mut() {
+                None => continue,
+                Some(v) => v,
             };
-            let last = match &names.pop().unwrap()[common_prefix.len()..] {
+            let fixup_key = names.clone();
+            if !names.starts_with(base_ns) {
+                names.splice(..0, base_ns.iter().cloned());
+            }
+            let last = names.pop().unwrap();
+            let was_bare = is_first_char_lowercase(&last);
+            let last = match &last[common_prefix.len()..] {
                 "" => "Base",
                 s => s,
             }.to_string();
             names.push(common_module.to_string());
             names.push(last);
+            let type_ir = TypeIR::from_names_and_hint(&names, was_bare);
+            resolve_map.insert(fixup_key, type_ir.clone());
+            resolve_map.insert(names.clone(), type_ir);
         }
     }
 
-    fn coalesce_methods(&self) -> BTreeMap<&str, BTreeMap<&Type, BTreeSet<&Constructor>>> {
-        let mut map: BTreeMap<&str, BTreeMap<&Type, BTreeSet<&Constructor>>> = BTreeMap::new();
-        for cons in &self.0 {
-            for field in cons.non_flag_fields() {
-                let name = match field.name.as_ref() {
-                    Some(s) => s.as_str(),
-                    None => continue,
-                };
-                map.entry(name)
-                    .or_insert_with(Default::default)
-                    .entry(&field.ty)
-                    .or_insert_with(Default::default)
-                    .insert(cons);
-            }
-        }
-        map
-    }
+}
+
+impl Constructors<TypeIR, FieldIR> {
+    // fn coalesce_methods(&self) -> BTreeMap<&str, BTreeMap<&Type, BTreeSet<&Constructor<TypeIR>>>> {
+    //     let mut map: BTreeMap<&str, BTreeMap<&Type, BTreeSet<&Constructor<TypeIR>>>> = BTreeMap::new();
+    //     for cons in &self.0 {
+    //         for field in cons.non_flag_fields() {
+    //             let name = match field.name.as_ref() {
+    //                 Some(s) => s.as_str(),
+    //                 None => continue,
+    //             };
+    //             map.entry(name)
+    //                 .or_insert_with(Default::default)
+    //                 .entry(&field.ty)
+    //                 .or_insert_with(Default::default)
+    //                 .insert(cons);
+    //         }
+    //     }
+    //     map
+    // }
 
     fn determine_methods(&self, enum_name: &syn::Ident) -> quote::Tokens {
         quote!()
@@ -1338,7 +1426,7 @@ impl Constructors {
     }
 
     fn as_type_impl(&self, name: &syn::Ident, type_id: quote::Tokens, serialize: quote::Tokens, deserialize: quote::Tokens) -> quote::Tokens {
-        let self_type = self.0[0].output.as_type().boxed();
+        let self_type = self.0[0].output.boxed();
         let tl_id_vec = self.as_tl_id_vec();
         quote! {
 
@@ -1417,20 +1505,17 @@ impl Constructors {
             if e != 0 {
                 ret.write_str("\n\n").unwrap();
             }
-            ret.write_str(&c.matched).unwrap();
+            //ret.write_str(&c.matched).unwrap();
         }
         write!(ret, "\n```\n").unwrap();
         ret
     }
 
     fn as_enum(&self) -> quote::Tokens {
-        let name = self.0[0].output.name()
-            .map(|s| {
-                println!("enumifying {:?}", s);
-                let s = parser::ident_to_upper_camel_case(s).unwrap();
-                no_conflict_ident(&s)
-            })
-            .unwrap();
+        if self.0.iter().all(|c| c.tl_id().is_none()) {
+            return quote!();
+        }
+        let name = self.0[0].output.name();
         let doc = self.as_enum_doc(&name);
         let variants = self.0.iter()
             .map(Constructor::as_variant);
@@ -1452,59 +1537,17 @@ impl Constructors {
         }
     }
 
-    fn as_dynamic_ctors(&self) -> Vec<(Option<Vec<String>>, u32, quote::Tokens)> {
-        let ty = self.0[0].output.as_type().unboxed();
-        let ty_name = self.0[0].output.names_vec();
-        self.0.iter()
-            .filter_map(|c| {
-                c.tl_id().map(|tl_id| {
-                    (ty_name.cloned(), c.tl_id.unwrap(), quote!(cstore.add::<#ty>(#tl_id)))
-                })
-            })
-            .collect()
-    }
-}
-
-fn make_fixup_map(constructors: &AllConstructors) -> TypeFixupMap {
-    let mut variants_to_outputs: TypeFixupMap = Default::default();
-
-    // let iter = constructors.items.iter()
-    //     .flat_map(|(ns, constructor_map)| {
-    //         constructor_map.iter().flat_map(move |(output, constructors)| {
-    //             constructors.0.iter().filter_map(move |constructor| {
-    //                 let variant_name = match constructor.variant {
-    //                     Type::Named(ref n) => n,
-    //                     _ => return None,
-    //                 };
-    //                 let mut full_output: Vec<String> = ns.iter().cloned().collect();
-    //                 full_output.extend(variant_name.last().cloned());
-    //                 Some((variant_name.clone(), full_output))
+    // fn as_dynamic_ctors(&self) -> Vec<(Option<Vec<String>>, u32, quote::Tokens)> {
+    //     let ty = self.0[0].output.unboxed();
+    //     let ty_name = self.0[0].output.names_vec();
+    //     self.0.iter()
+    //         .filter_map(|c| {
+    //             c.tl_id().map(|tl_id| {
+    //                 (ty_name.cloned(), c.tl_id.unwrap(), quote!(cstore.add::<#ty>(#tl_id)))
     //             })
     //         })
-    //     });
-
-    // let iter = constructors.functions.iter()
-    //     .flat_map(|(ns, constructors)| {
-    //         constructors.iter().filter_map(move |constructor| {
-    //             let variant_name = match constructor.variant {
-    //                 Type::Named(ref n) => n,
-    //                 _ => return None,
-    //             };
-    //             let mut full_output: Vec<String> = vec!["rpc".into()];
-    //             full_output.extend(ns.iter().cloned());
-    //             full_output.extend(variant_name.last().cloned());
-    //             Some((variant_name.clone(), full_output))
-    //         })
-    //     })
-    //     .chain(iter);
-
-    // for (k, v) in iter {
-    //     if let Some(old_value) = variants_to_outputs.insert(k, v) {
-    //         //panic!("duplicated key/value (value: {:?})", old_value);
-    //     }
+    //         .collect()
     // }
-
-    variants_to_outputs
 }
 
 pub fn generate_code_for(input: &str) -> String {
@@ -1521,8 +1564,6 @@ pub fn generate_code_for(input: &str) -> String {
 
         pub const LAYER: i32 = #layer;
     };
-
-    let variants_to_outputs = make_fixup_map(&constructors);
 
     // let mut dynamic_ctors = vec![];
     // for (ns, mut constructor_map) in constructors.types {
@@ -1553,32 +1594,6 @@ pub fn generate_code_for(input: &str) -> String {
     //     pub fn register_ctors<R: ::tl::parsing::Reader>(cstore: &mut ::tl::dynamic::TLCtorMap<R>) {
     //         cstore.add::<Vec<Object>>(::tl::VEC_TYPE_ID);
     //         #( #dynamic_ctors; )*
-    //     }
-    // });
-
-    // let mut rpc_items = vec![];
-    // for (ns, mut substructs) in constructors.functions {
-    //     substructs.sort_by(|c1, c2| c1.variant.cmp(&c2.variant));
-    //     let substructs = substructs.into_iter()
-    //         .map(|mut c| {
-    //             c.fixup(Delimiter::Functions, &variants_to_outputs);
-    //             c.as_function_struct()
-    //         });
-    //     match ns {
-    //         None => rpc_items.extend(substructs),
-    //         Some(name) => {
-    //             let name = no_conflict_ident(name.as_str());
-    //             rpc_items.push(quote! {
-    //                 pub mod #name {
-    //                     #( #substructs )*
-    //                 }
-    //             });
-    //         },
-    //     }
-    // }
-    // items.push(quote! {
-    //     pub mod rpc {
-    //         #( #rpc_items )*
     //     }
     // });
 

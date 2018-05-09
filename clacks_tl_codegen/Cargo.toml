@@ -6,6 +6,7 @@ license = "MIT/Apache-2.0"
 description = "codegen for clacks"
 
 [dependencies]
+derivative = "*"
 pom = "1"
 syn = "0.13"
 quote = "0.5"
