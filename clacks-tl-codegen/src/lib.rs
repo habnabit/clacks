@@ -1314,7 +1314,7 @@ impl Constructors<Type, Field> {
             None | Some("") => return,
             Some(s) => s.to_string(),
         };
-        let common_module = parser::ident_to_snake_case(&common_prefix).unwrap();
+        let common_module = &common_prefix;
         for c in &mut self.0 {
 
             if let Some(variant) = c.variant.names_vec_mut() {

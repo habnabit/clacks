@@ -6,7 +6,7 @@ extern crate extfmt;
 
 pub mod error;
 pub mod mtproto;
-pub mod mtproto_prelude;
+mod mtproto_prelude;
 
 use std::{fmt, io};
 use std::any::Any;
@@ -70,6 +70,10 @@ pub struct Serializer<'w> {
 }
 
 impl<'w> Serializer<'w> {
+    pub fn new(writer: &'w mut io::Write) -> Self {
+        Serializer { writer }
+    }
+
     pub fn write_constructor(&mut self, id: ConstructorNumber) -> Result<()> {
         use byteorder::{LittleEndian, WriteBytesExt};
         Ok(self.write_u32::<LittleEndian>(id.0)?)

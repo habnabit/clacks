@@ -1,23 +1,7 @@
-[package]
-name = "clacks"
-version = "0.0.2"
-authors = ["Aaron Gallagher <_@habnab.it>", "Connie Hilarides <connorcpu@live.com>"]
-license = "MIT/Apache-2.0"
-description = "minimal wrappers for telegram's mtproto serialization"
-
-[dependencies]
-byteorder = "1.2"
-error-chain = "0.11"
-extfmt = "0.1"
-
-[build-dependencies.clacks_tl_codegen]
-path = "clacks_tl_codegen"
-version = "0.0.2"
-
-[build-dependencies.rustfmt]
-version = "0.10"
-optional = true
-
-[features]
-default = []
-rustfmt-codegen = ["rustfmt"]
+[workspace]
+members = [
+    "clacks-crypto",
+    "clacks-mtproto",
+    "clacks-tl-codegen",
+    "clacks-transport",
+]

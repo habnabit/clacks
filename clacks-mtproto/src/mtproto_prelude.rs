@@ -12,6 +12,11 @@ impl fmt::Debug for bytes {
     }
 }
 
+impl ::std::ops::Deref for bytes {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] { self.0.as_slice() }
+}
+
 impl BareDeserialize for bytes {
     fn deserialize_bare(de: &mut Deserializer) -> Result<Self> {
         let vec = de.read_bare::<Vector<Bare, u8>>()?;
@@ -26,7 +31,7 @@ impl BareSerialize for bytes {
 }
 
 #[derive(Clone, Copy)]
-pub struct int128(pub [u8; 8]);
+pub struct int128(pub [u8; 16]);
 
 impl fmt::Debug for int128 {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -34,10 +39,15 @@ impl fmt::Debug for int128 {
     }
 }
 
+impl ::std::ops::Deref for int128 {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] { &self.0 }
+}
+
 impl BareDeserialize for int128 {
     fn deserialize_bare(de: &mut Deserializer) -> Result<Self> {
         use std::io::Read;
-        let mut buf = [0u8; 8];
+        let mut buf = [0u8; 16];
         de.read(&mut buf)?;
         Ok(int128(buf))
     }
@@ -52,7 +62,7 @@ impl BareSerialize for int128 {
 }
 
 #[derive(Clone, Copy)]
-pub struct int256(pub [u8; 16]);
+pub struct int256(pub [u8; 32]);
 
 impl fmt::Debug for int256 {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -60,10 +70,15 @@ impl fmt::Debug for int256 {
     }
 }
 
+impl ::std::ops::Deref for int256 {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] { &self.0 }
+}
+
 impl BareDeserialize for int256 {
     fn deserialize_bare(de: &mut Deserializer) -> Result<Self> {
         use std::io::Read;
-        let mut buf = [0u8; 16];
+        let mut buf = [0u8; 32];
         de.read(&mut buf)?;
         Ok(int256(buf))
     }
@@ -78,6 +93,12 @@ impl BareSerialize for int256 {
 }
 
 pub struct TLObject(Box<AnyBoxedSerialize>);
+
+impl TLObject {
+    pub fn new<I: AnyBoxedSerialize>(inner: I) -> Self {
+        TLObject(Box::new(inner))
+    }
+}
 
 impl Clone for TLObject {
     fn clone(&self) -> Self {
@@ -110,6 +131,12 @@ impl BoxedSerialize for TLObject {
 
 #[derive(Debug, Clone)]
 pub struct LengthPrefixed<T>(pub T);
+
+impl<T> From<T> for LengthPrefixed<T> {
+    fn from(x: T) -> Self {
+        LengthPrefixed(x)
+    }
+}
 
 impl<T> BoxedDeserialize for LengthPrefixed<T>
     where T: BoxedDeserialize,
