@@ -1,5 +1,6 @@
 use ::{AnyBoxedSerialize, BareDeserialize, BareSerialize, BoxedDeserialize, BoxedSerialize, ConstructorNumber, Deserializer, Result, Serializer};
 use extfmt::Hexlify;
+use rand::{Rand, Rng};
 use std::fmt;
 use std::marker::PhantomData;
 
@@ -30,7 +31,7 @@ impl BareSerialize for bytes {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 pub struct int128(pub [u8; 16]);
 
 impl fmt::Debug for int128 {
@@ -44,12 +45,20 @@ impl ::std::ops::Deref for int128 {
     fn deref(&self) -> &[u8] { &self.0 }
 }
 
+impl Rand for int128 {
+    fn rand<R: Rng>(rng: &mut R) -> Self {
+        let mut ret: Self = Default::default();
+        rng.fill_bytes(&mut ret.0);
+        ret
+    }
+}
+
 impl BareDeserialize for int128 {
     fn deserialize_bare(de: &mut Deserializer) -> Result<Self> {
         use std::io::Read;
-        let mut buf = [0u8; 16];
-        de.read(&mut buf)?;
-        Ok(int128(buf))
+        let mut ret: Self = Default::default();
+        de.read(&mut ret.0)?;
+        Ok(ret)
     }
 }
 
@@ -61,7 +70,7 @@ impl BareSerialize for int128 {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 pub struct int256(pub [u8; 32]);
 
 impl fmt::Debug for int256 {
@@ -75,12 +84,20 @@ impl ::std::ops::Deref for int256 {
     fn deref(&self) -> &[u8] { &self.0 }
 }
 
+impl Rand for int256 {
+    fn rand<R: Rng>(rng: &mut R) -> Self {
+        let mut ret: Self = Default::default();
+        rng.fill_bytes(&mut ret.0);
+        ret
+    }
+}
+
 impl BareDeserialize for int256 {
     fn deserialize_bare(de: &mut Deserializer) -> Result<Self> {
         use std::io::Read;
-        let mut buf = [0u8; 32];
-        de.read(&mut buf)?;
-        Ok(int256(buf))
+        let mut ret: Self = Default::default();
+        de.read(&mut ret.0)?;
+        Ok(ret)
     }
 }
 
@@ -138,23 +155,23 @@ impl<T> From<T> for LengthPrefixed<T> {
     }
 }
 
-impl<T> BoxedDeserialize for LengthPrefixed<T>
+impl<T> BareDeserialize for LengthPrefixed<T>
     where T: BoxedDeserialize,
 {
-    fn possible_constructors() -> Vec<ConstructorNumber> {
-        unimplemented!()
-    }
-
-    fn deserialize_boxed(id: ConstructorNumber, de: &mut Deserializer) -> Result<Self> {
+    fn deserialize_bare(de: &mut Deserializer) -> Result<Self> {
         unimplemented!()
     }
 }
 
-impl<T> BoxedSerialize for LengthPrefixed<T>
+impl<T> BareSerialize for LengthPrefixed<T>
     where T: BoxedSerialize,
 {
-    fn serialize_boxed<'this>(&'this self) -> (ConstructorNumber, &'this BareSerialize) {
-        unimplemented!()
+    fn serialize_bare(&self, ser: &mut Serializer) -> Result<()> {
+        use std::io::Write;
+        let inner = self.0.boxed_serialized_bytes()?;
+        ser.write_bare(&(inner.len() as i32))?;
+        ser.write(&inner)?;
+        Ok(())
     }
 }
 
@@ -325,6 +342,6 @@ impl_tl_primitive! { double, f64, read_f64, write_f64 }
 
 pub type Bool = bool;
 pub type Flags = i32;
-pub type LengthPrefixedTypedObject = LengthPrefixed<TypedObject>;
+pub type lengthPrefixedTypedObject = LengthPrefixed<TypedObject>;
 pub type string = String;
 pub type TypedObject = TLObject;

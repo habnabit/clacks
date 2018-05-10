@@ -3,6 +3,7 @@
 #[macro_use] extern crate error_chain;
 extern crate byteorder;
 extern crate extfmt;
+extern crate rand;
 
 pub mod error;
 pub mod mtproto;
@@ -27,6 +28,10 @@ pub struct Deserializer<'r> {
 }
 
 impl<'r> Deserializer<'r> {
+    pub fn new(reader: &'r mut io::Read) -> Self {
+        Deserializer { reader }
+    }
+
     pub fn read_constructor(&mut self) -> Result<ConstructorNumber> {
         use byteorder::{LittleEndian, ReadBytesExt};
         Ok(ConstructorNumber(self.read_u32::<LittleEndian>()?))
@@ -52,6 +57,10 @@ pub trait BareDeserialize
     where Self: Sized,
 {
     fn deserialize_bare(de: &mut Deserializer) -> Result<Self>;
+
+    fn bare_deserialized_from_bytes(mut bytes: &[u8]) -> Result<Self> {
+        Deserializer::new(&mut bytes).read_bare()
+    }
 }
 
 pub trait BoxedDeserialize
@@ -59,9 +68,13 @@ pub trait BoxedDeserialize
 {
     fn possible_constructors() -> Vec<ConstructorNumber>;
     fn deserialize_boxed(id: ConstructorNumber, de: &mut Deserializer) -> Result<Self>;
+
+    fn boxed_deserialized_from_bytes(mut bytes: &[u8]) -> Result<Self> {
+        Deserializer::new(&mut bytes).read_boxed()
+    }
 }
 
-pub trait Function {
+pub trait Function: BoxedSerialize {
     type Reply: BoxedDeserialize;
 }
 
@@ -83,7 +96,7 @@ impl<'w> Serializer<'w> {
         obj.serialize_bare(self)
     }
 
-    pub fn write_boxed<S: BoxedSerialize>(&mut self, obj: &S) -> Result<()> {
+    pub fn write_boxed<S: ?Sized + BoxedSerialize>(&mut self, obj: &S) -> Result<()> {
         let (constructor, bare) = obj.serialize_boxed();
         self.write_constructor(constructor)?;
         self.write_bare(bare)?;
@@ -103,10 +116,22 @@ impl<'w> io::Write for Serializer<'w> {
 
 pub trait BareSerialize {
     fn serialize_bare(&self, ser: &mut Serializer) -> Result<()>;
+
+    fn bare_serialized_bytes(&self) -> Result<Vec<u8>> {
+        let mut buf: Vec<u8> = vec![];
+        Serializer::new(&mut buf).write_bare(self)?;
+        Ok(buf)
+    }
 }
 
 pub trait BoxedSerialize {
     fn serialize_boxed<'this>(&'this self) -> (ConstructorNumber, &'this BareSerialize);
+
+    fn boxed_serialized_bytes(&self) -> Result<Vec<u8>> {
+        let mut buf: Vec<u8> = vec![];
+        Serializer::new(&mut buf).write_boxed(self)?;
+        Ok(buf)
+    }
 }
 
 pub trait IntoBoxed: BareSerialize {

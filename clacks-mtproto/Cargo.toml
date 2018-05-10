@@ -9,6 +9,7 @@ description = "minimal wrappers for telegram's mtproto serialization"
 byteorder = "1.2"
 error-chain = "0.11"
 extfmt = "0.1"
+rand = "*"
 
 [build-dependencies.clacks-tl-codegen]
 path = "../clacks-tl-codegen"
@@ -19,5 +20,5 @@ version = "0.10"
 optional = true
 
 [features]
-default = []
+default = ["rustfmt-codegen"]
 rustfmt-codegen = ["rustfmt"]

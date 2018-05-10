@@ -1,11 +1,13 @@
 use byteorder::{LittleEndian, ByteOrder, WriteBytesExt};
-use clacks_mtproto::{IntoBoxed, mtproto};
+use clacks_mtproto::{BareSerialize, IntoBoxed, mtproto};
+use clacks_mtproto::mtproto::wire::inbound_encrypted::InboundEncrypted;
+use clacks_mtproto::mtproto::wire::outbound_encrypted::OutboundEncrypted;
 use openssl::{aes, symm};
 use rand::Rng;
 use std::fmt;
 use std::io::{Cursor, Write};
 
-use error::Result;
+use error::{ErrorKind, Result};
 use {Padding, sha1_and_or_pad, sha1_bytes};
 
 #[derive(Default, Clone, Copy)]
@@ -40,7 +42,7 @@ impl AesParams {
         self.run_ige(encrypted, symm::Mode::Decrypt)
     }
 
-    pub fn from_pq_inner_data(data: &mtproto::p_q_inner_data::Base) -> Result<AesParams> {
+    pub fn from_pq_inner_data(data: &mtproto::p_q_inner_data::P_Q_inner_data) -> Result<AesParams> {
         let sha1_a = sha1_bytes(&[&data.new_nonce, &data.server_nonce])?;
         let sha1_b = sha1_bytes(&[&data.server_nonce, &data.new_nonce])?;
         let sha1_c = sha1_bytes(&[&data.new_nonce, &data.new_nonce])?;
@@ -140,12 +142,8 @@ impl AuthKey {
         Ok(mtproto::int128(ret))
     }
 
-    pub fn encrypt_message(&self, message: mtproto::manual::encrypted::Base) -> Result<Vec<u8>> {
-        let message = {
-            let mut buf: Vec<u8> = vec![];
-            ::clacks_mtproto::Serializer::new(&mut buf).write_bare(&message)?;
-            buf
-        };
+    pub fn encrypt_message(&self, message: OutboundEncrypted) -> Result<Vec<u8>> {
+        let message = message.bare_serialized_bytes()?;
         let message_hash = sha1_bytes(&[&message])?;
         let message_key = &message_hash[4..20];
         let aes = self.generate_message_aes_params(message_key, symm::Mode::Encrypt)?;
@@ -156,11 +154,28 @@ impl AuthKey {
         Ok(ret)
     }
 
-    pub fn decrypt_message(&self, message: &[u8]) -> Result<Vec<u8>> {
+    fn decrypt_message(&self, message: &[u8]) -> Result<Vec<u8>> {
         assert!(LittleEndian::read_i64(&message[..8]) == self.fingerprint);
         let message_key = &message[8..24];
         let aes = self.generate_message_aes_params(message_key, symm::Mode::Decrypt)?;
         aes.ige_decrypt(&message[24..])
+    }
+
+    pub fn decrypt_and_verify_message(&self, message: &[u8]) -> Result<(InboundEncrypted, Vec<u8>)> {
+        let decrypted = self.decrypt_message(message)?;
+        let (inbound, payload) = {
+            let mut bytes = &decrypted[..];
+            let inbound: InboundEncrypted = ::clacks_mtproto::Deserializer::new(&mut bytes).read_bare()?;
+            (inbound, bytes)
+        };
+        if inbound.payload_len as usize != payload.len() {
+            return Err(ErrorKind::AuthenticationFailure.into());
+        }
+        let computed_message_hash = sha1_bytes(&[&decrypted])?;
+        if &message[8..24] != &computed_message_hash[4..20] {
+            return Err(ErrorKind::AuthenticationFailure.into());
+        }
+        Ok((inbound, payload.into()))
     }
 
     pub fn into_inner(self) -> [u8; AuthKey::SIZE] {
@@ -171,12 +186,12 @@ impl AuthKey {
                                       -> Result<(i64, mtproto::rpc::auth::bindTempAuthKey)> {
         let nonce: i64 = rng.gen();
         let temp_session_id: i64 = rng.gen();
-        let inner = mtproto::manual::encrypted::Base {
+        let inner = OutboundEncrypted {
             message_id,
             salt: rng.gen(),
             session_id: rng.gen(),
             seq_no: 0,
-            payload: (mtproto::TLObject::new(mtproto::manual::bind_auth_key_inner::Base {
+            payload: (mtproto::TLObject::new(mtproto::manual::bind_auth_key_inner::BindAuthKeyInner {
                 nonce, expires_at,
                 temp_auth_key_id: temp_key.fingerprint,
                 perm_auth_key_id: self.fingerprint,

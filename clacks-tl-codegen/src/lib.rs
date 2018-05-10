@@ -1177,7 +1177,9 @@ impl Constructor<TypeIR, FieldIR> {
 
     fn as_function_struct(&self) -> quote::Tokens {
         let name = self.variant_name();
+        let tl_id = self.tl_id().unwrap();
         let rpc_generics = self.rpc_generics();
+        let serialize_generics = self.serialize_generics();
         let generics = self.generics();
         let struct_block = self.as_struct_base(&name);
         let mut output_ty = self.output.boxed();
@@ -1192,11 +1194,20 @@ impl Constructor<TypeIR, FieldIR> {
             &name,
             quote!(#serialize_destructure #serialize_stmts Ok(())),
             None);
+
         quote! {
             #struct_block
+
+            impl #serialize_generics ::BoxedSerialize for #name #generics {
+                fn serialize_boxed<'this>(&'this self) -> (::ConstructorNumber, &'this ::BareSerialize) {
+                    (#tl_id, self)
+                }
+            }
+
             impl #rpc_generics ::Function for #name #generics {
                 type Reply = #output_ty;
             }
+
             #type_impl
         }
     }
@@ -1334,7 +1345,7 @@ impl Constructors<Type, Field> {
             let last = names.pop().unwrap();
             let was_bare = is_first_char_lowercase(&last);
             let last = match &last[common_prefix.len()..] {
-                "" => "Base",
+                "" => c.output.name().unwrap(),
                 s => s,
             }.to_string();
             names.push(common_module.to_string());
