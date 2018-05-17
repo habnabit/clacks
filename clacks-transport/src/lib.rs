@@ -23,6 +23,7 @@ pub mod error {
         }
 
         errors {
+            ErrorCode(code: i32) {}
             InvalidData {}
             BoxedAsBare {}
             ReceivedSendType {}

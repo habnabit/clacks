@@ -5,8 +5,11 @@ authors = ["Aaron Gallagher <_@habnab.it>", "Connie Hilarides <connorcpu@live.co
 license = "MIT/Apache-2.0"
 
 [dependencies]
+byteorder = "*"
+chrono = "*"
 error-chain = "*"
 futures = "0.1"
+futures-await = "*"
 rand = "*"
 tokio = "*"
 tokio-io = "*"

@@ -9,16 +9,17 @@ description = "minimal wrappers for telegram's mtproto serialization"
 byteorder = "1.2"
 error-chain = "0.11"
 extfmt = "0.1"
+lazy_static = "*"
 rand = "*"
 
 [build-dependencies.clacks-tl-codegen]
 path = "../clacks-tl-codegen"
 version = "0.0.2"
 
-[build-dependencies.rustfmt]
-version = "0.10"
+[build-dependencies.rustfmt-nightly]
+version = "0.7"
 optional = true
 
 [features]
 default = ["rustfmt-codegen"]
-rustfmt-codegen = ["rustfmt"]
+rustfmt-codegen = ["rustfmt-nightly"]

@@ -168,10 +168,13 @@ impl AuthKey {
             let inbound: InboundEncrypted = ::clacks_mtproto::Deserializer::new(&mut bytes).read_bare()?;
             (inbound, bytes)
         };
-        if inbound.payload_len as usize != payload.len() {
-            return Err(ErrorKind::AuthenticationFailure.into());
-        }
-        let computed_message_hash = sha1_bytes(&[&decrypted])?;
+        let payload_len = inbound.payload_len as usize;
+        let padding = match payload.len().checked_sub(payload_len) {
+            Some(i) => i,
+            None => return Err(ErrorKind::AuthenticationFailure.into()),
+        };
+        let payload = &payload[..payload_len];
+        let computed_message_hash = sha1_bytes(&[&decrypted[..decrypted.len() - padding]])?;
         if &message[8..24] != &computed_message_hash[4..20] {
             return Err(ErrorKind::AuthenticationFailure.into());
         }

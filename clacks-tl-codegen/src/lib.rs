@@ -36,7 +36,7 @@ pub mod parser {
         }
 
         pub fn names_vec_mut(&mut self) -> Option<&mut Vec<String>> {
-            use self::Type::*;
+            use self::Type::*; 
             match *self {
                 Int |
                 Flags |
@@ -92,6 +92,8 @@ pub mod parser {
         pub type_parameters: Vec<Fi>,
         pub fields: Vec<Fi>,
         pub output: Ty,
+        pub original_variant: String,
+        pub original_output: String,
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -200,10 +202,13 @@ pub mod parser {
     }
 
     fn constructor() -> Parser<u8, Constructor<Type, Field>> {
-        (dotted_ident() + tl_id().opt() + fields() - seq(b" = ") + ty_space_generic() - sym(b';'))
+        (output_and_matched(dotted_ident()) + tl_id().opt() + fields() - seq(b" = ") + output_and_matched(ty_space_generic()) - sym(b';'))
             .map(|(((variant, tl_id), (type_parameters, fields)), output)| Constructor {
-                tl_id, type_parameters, fields, output,
-                variant: Type::Named(variant),
+                tl_id, type_parameters, fields, 
+                original_variant: variant.1,
+                variant: Type::Named(variant.0),
+                original_output: output.1,
+                output: output.0,
             })
             .name("constructor")
     }
@@ -294,7 +299,7 @@ pub mod parser {
 
 pub use parser::{Constructor, Delimiter, Field, Item, Matched, Type};
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::BTreeMap;
 use std::mem;
 
 fn fail_hard() -> quote::Tokens {
@@ -303,15 +308,15 @@ fn fail_hard() -> quote::Tokens {
 
 #[derive(Derivative)]
 #[derivative(Debug, Default(bound = ""))]
-struct Constructors<Ty, Fi>(Vec<Constructor<Ty, Fi>>);
+struct Constructors<Ty, Fi>(Vec<Matched<Constructor<Ty, Fi>>>);
 
 type TypeResolutionMap = BTreeMap<Vec<String>, TypeIR>;
 
 #[derive(Debug)]
 enum NamespaceItem {
     AsEnum(Constructors<TypeIR, FieldIR>),
-    AsVariant(Constructor<TypeIR, FieldIR>),
-    AsFunction(Constructor<TypeIR, FieldIR>),
+    AsVariant(Matched<Constructor<TypeIR, FieldIR>>),
+    AsFunction(Matched<Constructor<TypeIR, FieldIR>>),
     AnotherNamespace(Namespace),
 }
 
@@ -323,8 +328,8 @@ impl NamespaceItem {
         use self::NamespaceItem::*;
         match *self {
             AsEnum(ref cs) => cs.as_enum(),
-            AsVariant(ref c) => c.as_variant_type_struct(),
-            AsFunction(ref c) => c.as_function_struct(),
+            AsVariant(ref cm) => cm.0.as_variant_type_struct(&cm.1),
+            AsFunction(ref cm) => cm.0.as_function_struct(&cm.1),
             AnotherNamespace(ref ns) => {
                 let inner = ns.as_tokens();
                 quote! { pub mod #name { #inner } }
@@ -360,6 +365,21 @@ impl Namespace {
         let items = self.0.iter().map(|(name, item)| item.as_tokens(name));
         quote!(#( #items )*)
     }
+
+    fn populate_all_constructors<'this>(&'this self, to_populate: &mut Vec<&'this Constructors<TypeIR, FieldIR>>) {
+        use self::NamespaceItem::*;
+        for item in self.0.values() {
+            match *item {
+                AsEnum(ref cs) => {
+                    to_populate.push(cs);
+                },
+                AnotherNamespace(ref ns) => {
+                    ns.populate_all_constructors(to_populate);
+                },
+                _ => (),
+            };
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -383,48 +403,84 @@ fn filter_items(iv: &mut Vec<Matched<Item>>) {
     });
 }
 
-fn partition_by_delimiter_and_namespace(iv: Vec<Matched<Item>>) -> AllConstructors {
-    use self::NamespaceItem::*;
-    let mut current = Delimiter::Types;
-    let mut ret = AllConstructors {
-        items: Default::default(),
-        layer: 0,
-    };
-    let mut constructorses: BTreeMap<Vec<String>, Constructors<Type, Field>> = BTreeMap::new();
-    let mut functions: Vec<Constructor<Type, Field>> = Vec::new();
-    for Matched(i, _) in iv {
-        match i {
-            Item::Delimiter(d) => current = d,
-            Item::Constructor(mut c) => {
-                match current {
-                    Delimiter::Types => {
-                        constructorses.entry(c.output.owned_names_vec())
-                            .or_insert_with(Default::default)
-                            .0.push(c);
-                    },
-                    Delimiter::Functions => functions.push(c),
-                }
-            },
-            Item::Layer(i) => ret.layer = i,
+impl AllConstructors {
+    fn from_matched_items(iv: Vec<Matched<Item>>) -> Self {
+        use self::NamespaceItem::*;
+        let mut current = Delimiter::Types;
+        let mut ret = AllConstructors {
+            items: Default::default(),
+            layer: 0,
+        };
+        let mut constructorses: BTreeMap<Vec<String>, Constructors<Type, Field>> = BTreeMap::new();
+        let mut functions: Vec<Matched<Constructor<Type, Field>>> = Vec::new();
+        for Matched(i, m) in iv {
+            match i {
+                Item::Delimiter(d) => current = d,
+                Item::Constructor(mut c) => {
+                    match current {
+                        Delimiter::Types => {
+                            constructorses.entry(c.output.owned_names_vec())
+                                .or_insert_with(Default::default)
+                                .0.push(Matched(c, m));
+                        },
+                        Delimiter::Functions => functions.push(Matched(c, m)),
+                    }
+                }, 
+                Item::Layer(i) => ret.layer = i,
+            }
+        }
+        let mut resolve_map: TypeResolutionMap = Default::default();
+        for (_, mut cs) in constructorses {
+            let base_ns = cs.first_constructor().output.namespaces().to_vec();
+            cs.trim_common_prefixes(&base_ns, &mut resolve_map);
+            let mut cs = cs.resolve(&resolve_map);
+            for &Matched(ref c, ref m) in &cs.0 {
+                ret.items.insert(
+                    c.variant.owned_names_vec(), 
+                    AsVariant(Matched(c.clone(), m.clone())));
+            }
+            ret.items.insert(cs.first_constructor().output.owned_names_vec(), AsEnum(cs));
+        }
+        for Matched(c, m) in functions {
+            let c = c.resolve(Delimiter::Functions, &resolve_map);
+            let mut ns = c.variant.owned_names_vec();
+            ns.insert(0, no_conflict_ident("rpc"));
+            ret.items.insert(ns, AsFunction(Matched(c, m)));
+        }
+        ret
+    }
+
+    fn as_dynamic_deserializers(&self) -> quote::Tokens {
+        let mut all_constructors = Default::default();
+        self.items.populate_all_constructors(&mut all_constructors);
+        let dynamic_deserializer = all_constructors.iter()
+            .map(|cs| cs.as_dynamic_deserializer());
+
+        quote! {
+
+            lazy_static! {                
+                pub static ref DYNAMIC_DESERIALIZERS: 
+                    ::std::collections::BTreeMap<::ConstructorNumber, ::DynamicDeserializer> = 
+                {
+                    let mut ret = ::std::collections::BTreeMap::new();
+                    #( #dynamic_deserializer )*
+                    ret
+                };
+            }
+
         }
     }
-    let mut resolve_map: TypeResolutionMap = Default::default();
-    for (_, mut cs) in constructorses {
-        let base_ns = cs.0[0].output.namespaces().to_vec();
-        cs.trim_common_prefixes(&base_ns, &mut resolve_map);
-        let mut cs = cs.resolve(&resolve_map);
-        for c in &mut cs.0 {
-            ret.items.insert(c.variant.owned_names_vec(), AsVariant(c.clone()));
+
+    fn as_tokens(&self) -> quote::Tokens {
+        let ns_tokens = self.items.as_tokens();
+        let dynamic_deserializers = self.as_dynamic_deserializers();
+        quote! {
+
+            #ns_tokens
+            #dynamic_deserializers
+
         }
-        ret.items.insert(cs.0[0].output.owned_names_vec(), AsEnum(cs));
     }
-    for c in functions {
-        let c = c.resolve(Delimiter::Functions, &resolve_map);
-        let mut ns = c.variant.owned_names_vec();
-        ns.insert(0, no_conflict_ident("rpc"));
-        ret.items.insert(ns, AsFunction(c));
-    }
-    ret
 }
 
 fn no_conflict_ident(s: &str) -> syn::Ident {
@@ -527,7 +583,7 @@ impl WireKind {
             Some("true") => FlaggedTrue,
             Some(s) if force_bare || is_first_char_lowercase(s) =>
                 Bare(names.iter().map(String::as_str).collect()),
-            Some(s) =>
+            Some(_) =>
                 Boxed(names.iter().map(String::as_str).collect()),
             None => unimplemented!(),
         }
@@ -803,12 +859,10 @@ struct FieldIR {
 impl Field {
     fn resolved(&self, resolve_map: &TypeResolutionMap, replace_string_with_bytes: bool) -> FieldIR {
         let name = self.name.clone().unwrap();
-        let ty = match name.as_str() {
-            "flags" =>
-                self.ty.resolved(resolve_map, true),
-            "bytes" if replace_string_with_bytes =>
-                TypeIR::bytes(),
-            _ => self.ty.resolved(resolve_map, false),
+        let ty = if replace_string_with_bytes && self.ty.name() == Some("string") {
+            TypeIR::bytes()
+        } else {
+            self.ty.resolved(resolve_map, &name == "flags")
         };
         let flag_bit = self.ty.flag_field().map(|(_, b)| b);
         FieldIR { ty, name, flag_bit }
@@ -874,6 +928,8 @@ impl Constructor<Type, Field> {
                 .map(|t| t.resolved(resolve_map, false))
                 .collect(),
             tl_id: self.tl_id,
+            original_variant: self.original_variant,
+            original_output: self.original_output,
         }
     }
 
@@ -899,13 +955,15 @@ impl Constructor<Type, Field> {
     }
 
     fn resolved_fields(&self, resolve_map: &TypeResolutionMap) -> Vec<FieldIR> {
-        let replace_string_with_bytes = match self.variant.name().unwrap_or("") {
+        let replace_string_with_bytes = match self.original_variant.as_str() {
+            // types
             "resPQ" |
             "p_q_inner_data" |
             "p_q_inner_data_temp" |
             "server_DH_params_ok" |
             "server_DH_inner_data" |
             "client_DH_inner_data" |
+            // functions
             "req_DH_params" |
             "set_client_DH_params" => true,
             _ => false,
@@ -997,12 +1055,12 @@ impl Constructor<TypeIR, FieldIR> {
         Some(determination)
     }
 
-    fn as_struct_doc(&self, name: &syn::Ident) -> String {
-        format!("TL-derived struct `{}`\n\n```text\n{}\n```\n", name, "")//self.matched)
+    fn as_struct_doc(&self, matched: &str) -> String {
+        format!("TL-derived from `{}`\n\n```text\n{}\n```\n", self.original_variant, matched)
     }
 
-    fn as_struct_base(&self, name: &syn::Ident) -> quote::Tokens {
-        let doc = self.as_struct_doc(name);
+    fn as_struct_base(&self, name: &syn::Ident, matched: &str) -> quote::Tokens {
+        let doc = self.as_struct_doc(matched);
         let generics = self.generics();
         let fields = self.fields_tokens(quote! {pub}, quote! {;});
         quote! {
@@ -1073,7 +1131,7 @@ impl Constructor<TypeIR, FieldIR> {
         })
     }
 
-    fn as_type_struct_base(&self, name: syn::Ident) -> quote::Tokens {
+    fn as_type_struct_base(&self, name: syn::Ident, matched: &str) -> quote::Tokens {
         let serialize_destructure = self.as_variant_ref_destructure(&name)
             .map(|d| quote! { let &#d = self; })
             .unwrap_or_else(|| quote!());
@@ -1091,7 +1149,7 @@ impl Constructor<TypeIR, FieldIR> {
                 #flag_init
                 Ok(#name #deserialize)
             }));
-        let struct_block = self.as_struct_base(&name);
+        let struct_block = self.as_struct_base(&name, matched);
         let into_boxed = self.as_into_boxed(&name);
         quote! {
             #struct_block
@@ -1100,25 +1158,15 @@ impl Constructor<TypeIR, FieldIR> {
         }
     }
 
-    fn as_single_type_struct(&self) -> quote::Tokens {
-        let name = self.variant_name();
-        let output_name = self.output.name();
-        let type_struct = self.as_type_struct_base(name);
-        quote! {
-            #type_struct
-            type #output_name = #name;
-        }
-    }
-
     fn variant_name(&self) -> syn::Ident {
         self.variant.name()
     }
 
-    fn as_variant_type_struct(&self) -> quote::Tokens {
+    fn as_variant_type_struct(&self, matched: &str) -> quote::Tokens {
         if self.fields.is_empty() {
             quote!()
         } else {
-            self.as_type_struct_base(self.variant_name())
+            self.as_type_struct_base(self.variant_name(), matched)
         }
     }
 
@@ -1175,13 +1223,13 @@ impl Constructor<TypeIR, FieldIR> {
         }
     }
 
-    fn as_function_struct(&self) -> quote::Tokens {
+    fn as_function_struct(&self, matched: &str) -> quote::Tokens {
         let name = self.variant_name();
         let tl_id = self.tl_id().unwrap();
         let rpc_generics = self.rpc_generics();
         let serialize_generics = self.serialize_generics();
         let generics = self.generics();
-        let struct_block = self.as_struct_base(&name);
+        let struct_block = self.as_struct_base(&name, matched);
         let mut output_ty = self.output.boxed();
         if self.output.is_type_parameter() {
             output_ty = quote! {#output_ty::Reply};
@@ -1261,8 +1309,6 @@ impl Constructor<TypeIR, FieldIR> {
     fn as_type_impl(&self, name: &syn::Ident, serialize: quote::Tokens, deserialize: Option<quote::Tokens>) -> quote::Tokens {
         let serialize_generics = self.serialize_generics();
         let ty = self.as_variant_generic_type();
-        let write_method = ty.as_write_method();
-        let self_type = ty.boxed();
         let generics = self.generics();
 
         let deserialize = deserialize.map(|body| {
@@ -1307,11 +1353,17 @@ fn common_prefix_of<'a>(a: Option<&'a str>, b: &'a str) -> &'a str {
     &ret[..min_len]
 }
 
+impl<Ty, Fi> Constructors<Ty, Fi> {
+    fn first_constructor(&self) -> &Constructor<Ty, Fi> {
+        &self.0[0].0
+    }
+}
+
 impl Constructors<Type, Field> {
     fn resolve(self, resolve_map: &TypeResolutionMap) -> Constructors<TypeIR, FieldIR> {
         Constructors({
             self.0.into_iter()
-                .map(|c| c.resolve(Delimiter::Types, resolve_map))
+                .map(|Matched(c, m)| Matched(c.resolve(Delimiter::Types, resolve_map), m))
                 .collect()
         })
     }
@@ -1319,14 +1371,14 @@ impl Constructors<Type, Field> {
     fn trim_common_prefixes(&mut self, base_ns: &[String], resolve_map: &mut TypeResolutionMap) {
         let common_prefix = match {
             self.0.iter()
-                .filter_map(|c| c.variant.name())
+                .filter_map(|m| m.0.variant.name())
                 .fold(None, |a, b| Some(common_prefix_of(a, b)))
-        } {
+        } { 
             None | Some("") => return,
             Some(s) => s.to_string(),
         };
         let common_module = &common_prefix;
-        for c in &mut self.0 {
+        for &mut Matched(ref mut c, _) in &mut self.0 {
 
             if let Some(variant) = c.variant.names_vec_mut() {
                 if !variant.starts_with(&base_ns) {
@@ -1437,8 +1489,8 @@ impl Constructors<TypeIR, FieldIR> {
     }
 
     fn as_type_impl(&self, name: &syn::Ident, type_id: quote::Tokens, serialize: quote::Tokens, deserialize: quote::Tokens) -> quote::Tokens {
-        let self_type = self.0[0].output.boxed();
-        let tl_id_vec = self.as_tl_id_vec();
+        let tl_ids = self.as_tl_ids();
+
         quote! {
 
             impl ::BoxedSerialize for #name {
@@ -1448,7 +1500,7 @@ impl Constructors<TypeIR, FieldIR> {
             }
 
             impl ::BoxedDeserialize for #name {
-                fn possible_constructors() -> Vec<::ConstructorNumber> { #tl_id_vec }
+                fn possible_constructors() -> Vec<::ConstructorNumber> { vec![#tl_ids] }
                 fn deserialize_boxed(_id: ::ConstructorNumber, _de: &mut ::Deserializer) -> ::Result<Self> {
                     #deserialize
                 }
@@ -1457,12 +1509,16 @@ impl Constructors<TypeIR, FieldIR> {
         }
     }
 
+    fn constructors_and_tl_ids<'this>(&'this self) -> Box<'this + Iterator<Item = (quote::Tokens, &'this Constructor<TypeIR, FieldIR>)>> {
+        Box::new(self.0.iter().filter_map(|cm| {
+            cm.0.tl_id().map(|id| (id, &cm.0))
+        }))
+    }
+
     fn as_type_id_match(&self, enum_name: &syn::Ident) -> quote::Tokens {
-        let constructors = self.0.iter()
-            .filter(|c| c.tl_id().is_some())
-            .map(|c| {
+        let constructors = self.constructors_and_tl_ids()
+            .map(|(tl_id, c)| {
                 let pat = c.as_variant_empty_pattern();
-                let tl_id = c.tl_id();
                 quote!(&#enum_name::#pat => #tl_id)
             });
         quote! {
@@ -1474,7 +1530,7 @@ impl Constructors<TypeIR, FieldIR> {
 
     fn as_serialize_match(&self, enum_name: &syn::Ident) -> quote::Tokens {
         let constructors = self.0.iter()
-            .map(|c| {
+            .map(|&Matched(ref c, _)| {
                 let variant_name = c.variant_name();
                 let serialize = c.as_variant_serialize_arm();
                 quote!(&#enum_name::#variant_name #serialize)
@@ -1486,18 +1542,27 @@ impl Constructors<TypeIR, FieldIR> {
         }
     }
 
-    fn as_tl_id_vec(&self) -> quote::Tokens {
+    fn as_tl_ids(&self) -> quote::Tokens {
         let tl_ids = self.0.iter()
-            .map(|c| c.tl_id());
-        quote!(vec![#( #tl_ids ),*])
+            .filter_map(|cm| cm.0.tl_id());
+        quote!(#( #tl_ids, )*)
+    }
+
+    fn as_dynamic_deserializer(&self) -> quote::Tokens {
+        let constructors = self.constructors_and_tl_ids()
+            .map(|(tl_id, c)| {
+                let ty = c.output.unboxed();
+                quote!(ret.insert(#tl_id, <#ty as ::BoxedDeserializeDynamic>::boxed_deserialize_to_box as ::DynamicDeserializer))
+            });
+        quote! {
+            #( #constructors; )*
+        }
     }
 
     fn as_deserialize_match(&self, enum_name: &syn::Ident) -> quote::Tokens {
-        let constructors = self.0.iter()
-            .filter(|c| c.tl_id().is_some())
-            .map(|c| {
+        let constructors = self.constructors_and_tl_ids()
+            .map(|(tl_id, c)| {
                 let variant_name = c.variant_name();
-                let tl_id = c.tl_id();
                 let deserialize = c.as_variant_deserialize();
                 quote!(#tl_id => Ok(#enum_name::#variant_name #deserialize))
             });
@@ -1509,27 +1574,27 @@ impl Constructors<TypeIR, FieldIR> {
         }
     }
 
-    fn as_enum_doc(&self, name: &syn::Ident) -> String {
+    fn as_enum_doc(&self) -> String {
         use std::fmt::Write;
-        let mut ret = format!("TL-derived struct `{}`\n\n```text\n", name);
-        for (e, c) in self.0.iter().enumerate() {
+        let mut ret = format!("TL-derived from `{}`\n\n```text\n", &self.first_constructor().original_output);
+        for (e, cm) in self.0.iter().enumerate() {
             if e != 0 {
                 ret.write_str("\n\n").unwrap();
             }
-            //ret.write_str(&c.matched).unwrap();
+            ret.write_str(&cm.1).unwrap();
         }
         write!(ret, "\n```\n").unwrap();
         ret
     }
 
     fn as_enum(&self) -> quote::Tokens {
-        if self.0.iter().all(|c| c.tl_id().is_none()) {
+        if self.0.iter().all(|cm| cm.0.tl_id().is_none()) {
             return quote!();
         }
-        let name = self.0[0].output.name();
-        let doc = self.as_enum_doc(&name);
+        let name = self.first_constructor().output.name();
+        let doc = self.as_enum_doc();
         let variants = self.0.iter()
-            .map(Constructor::as_variant);
+            .map(|cm| cm.0.as_variant());
         let methods = self.determine_methods(&name);
         let type_impl = self.as_type_impl(
             &name,
@@ -1547,25 +1612,13 @@ impl Constructors<TypeIR, FieldIR> {
             #type_impl
         }
     }
-
-    // fn as_dynamic_ctors(&self) -> Vec<(Option<Vec<String>>, u32, quote::Tokens)> {
-    //     let ty = self.0[0].output.unboxed();
-    //     let ty_name = self.0[0].output.names_vec();
-    //     self.0.iter()
-    //         .filter_map(|c| {
-    //             c.tl_id().map(|tl_id| {
-    //                 (ty_name.cloned(), c.tl_id.unwrap(), quote!(cstore.add::<#ty>(#tl_id)))
-    //             })
-    //         })
-    //         .collect()
-    // }
 }
 
 pub fn generate_code_for(input: &str) -> String {
     let constructors = {
         let mut items = parser::parse_string(input).unwrap();
         filter_items(&mut items);
-        partition_by_delimiter_and_namespace(items)
+        AllConstructors::from_matched_items(items)
     };
 
     let layer = constructors.layer as i32;
@@ -1576,39 +1629,7 @@ pub fn generate_code_for(input: &str) -> String {
         pub const LAYER: i32 = #layer;
     };
 
-    // let mut dynamic_ctors = vec![];
-    // for (ns, mut constructor_map) in constructors.types {
-    //     dynamic_ctors.extend(
-    //         constructor_map.values().flat_map(Constructors::as_dynamic_ctors));
-    //     let substructs = constructor_map.values_mut()
-    //         .map(|c| {
-    //             c.fixup(Delimiter::Functions, &variants_to_outputs);
-    //             c.as_structs()
-    //         });
-    //     match ns {
-    //         None => items.extend(substructs),
-    //         Some(name) => {
-    //             let name = no_conflict_ident(name.as_str());
-    //             items.push(quote! {
-    //                 pub mod #name {
-    //                     #( #substructs )*
-    //                 }
-    //             });
-    //         },
-    //     }
-    // }
-
-    // dynamic_ctors.sort_by(|t1, t2| (&t1.0, t1.1).cmp(&(&t2.0, t2.1)));
-    // let dynamic_ctors = dynamic_ctors.into_iter()
-    //     .map(|t| t.2);
-    // items.push(quote! {
-    //     pub fn register_ctors<R: ::tl::parsing::Reader>(cstore: &mut ::tl::dynamic::TLCtorMap<R>) {
-    //         cstore.add::<Vec<Object>>(::tl::VEC_TYPE_ID);
-    //         #( #dynamic_ctors; )*
-    //     }
-    // });
-
-    let items = constructors.items.as_tokens();
+    let items = constructors.as_tokens();
 
     quote!(
         #prelude

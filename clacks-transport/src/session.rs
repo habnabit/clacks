@@ -57,14 +57,12 @@ pub struct OutboundMessage {
 }
 
 #[derive(Debug, Clone)]
-pub struct InboundPayload {
+pub struct InboundMessage {
     pub message_id: i64,
     pub payload: Vec<u8>,
     pub was_encrypted: bool,
     pub seq_no: Option<i32>,
 }
-
-pub type InboundMessage = ::std::result::Result<InboundPayload, i32>;
 
 impl Session {
     pub fn new(session_id: i64, app_id: AppId) -> Session {
@@ -186,7 +184,7 @@ impl Session {
         where P: AnyBoxedSerialize,
     {
         let message_id = next_message_id();
-        let message = mtproto::wire::plain::Plain {
+        let message = mtproto::wire::outbound_raw::OutboundRaw {
             message_id,
             auth_key_id: 0,
             payload: mtproto::TLObject::new(payload).into(),
@@ -206,7 +204,7 @@ impl Session {
 
     pub fn process_message(&self, message: &[u8]) -> Result<InboundMessage> {
         if message.len() == 4 {
-            return Ok(Err(LittleEndian::read_i32(&message)));
+            return Err(ErrorKind::ErrorCode(LittleEndian::read_i32(&message)).into());
         } else if message.len() < 8 {
             panic!("bad message");
         }
@@ -226,12 +224,12 @@ impl Session {
             return Err(ErrorKind::AuthenticationFailure.into());
         }
         let payload = &message[pos..pos+len];
-        Ok(Ok(InboundPayload {
+        Ok(InboundMessage {
             message_id: message_id,
             payload: payload.into(),
             was_encrypted: false,
             seq_no: None,
-        }))
+        })
     }
 
     fn decrypt_message(&self, message: &[u8]) -> Result<InboundMessage> {
@@ -242,12 +240,12 @@ impl Session {
         if !self.server_salts.iter().any(|s| s.salt == inbound.salt) {
             println!("salt failure: {} not in {:#?}", inbound.salt, self.server_salts);
         }
-        Ok(Ok(InboundPayload {
+        Ok(InboundMessage {
             payload,
             message_id: inbound.message_id,
             was_encrypted: true,
             seq_no: Some(inbound.seq_no),
-        }))
+        })
     }
 
     pub fn bind_from_permanent_auth_key<R: Rng>(&mut self, perm_key: AuthKey, expires_at: i32, rng: &mut R)
