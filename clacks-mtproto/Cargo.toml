@@ -1,28 +1,20 @@
 [package]
 name = "clacks-mtproto"
-version = "0.0.2"
+version = "0.0.3"
 authors = ["Aaron Gallagher <_@habnab.it>", "Connie Hilarides <connorcpu@live.com>"]
 license = "MIT/Apache-2.0"
 description = "minimal wrappers for telegram's mtproto serialization"
 
 [dependencies]
 byteorder = "1.2"
-erased-serde = "*"
+erased-serde = "0.3"
 error-chain = "0.11"
 extfmt = "0.1"
-lazy_static = "*"
-rand = "*"
+lazy_static = "1.0"
+rand = "0.4"
 serde = "1.0"
 serde_derive = "1.0"
 
 [build-dependencies.clacks-tl-codegen]
 path = "../clacks-tl-codegen"
-version = "0.0.2"
-
-[build-dependencies.rustfmt-nightly]
-version = "0.7"
-optional = true
-
-[features]
-default = ["rustfmt-codegen"]
-rustfmt-codegen = ["rustfmt-nightly"]
+version = "0.0.3"

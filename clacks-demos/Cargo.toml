@@ -1,6 +1,6 @@
 [package]
 name = "clacks-demos"
-version = "0.0.2"
+version = "0.0.3"
 authors = ["Aaron Gallagher <_@habnab.it>", "Connie Hilarides <connorcpu@live.com>"]
 license = "MIT/Apache-2.0"
 
@@ -18,16 +18,15 @@ tokio-io = "*"
 
 [dependencies.clacks-mtproto]
 path = "../clacks-mtproto"
-version = "0.0.2"
-features = ["rustfmt-codegen"]
+version = "0.0.3"
 
 [dependencies.clacks-crypto]
 path = "../clacks-crypto"
-version = "0.0.2"
+version = "0.0.3"
 
 [dependencies.clacks-transport]
 path = "../clacks-transport"
-version = "0.0.2"
+version = "0.0.3"
 
 [dependencies.sexpr]
 git = "https://github.com/zshipko/sexpr"

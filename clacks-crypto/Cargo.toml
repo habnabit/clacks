@@ -1,15 +1,15 @@
 [package]
 name = "clacks-crypto"
-version = "0.0.2"
+version = "0.0.3"
 authors = ["Aaron Gallagher <_@habnab.it>", "Connie Hilarides <connorcpu@live.com>"]
 license = "MIT/Apache-2.0"
 
 [dependencies]
-byteorder = "*"
-error-chain = "*"
-openssl = "*"
-rand = "*"
+byteorder = "1.2"
+error-chain = "0.11"
+openssl = "0.10"
+rand = "0.4"
 
 [dependencies.clacks-mtproto]
 path = "../clacks-mtproto"
-version = "0.0.2"
+version = "0.0.3"

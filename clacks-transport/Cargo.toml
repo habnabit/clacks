@@ -1,22 +1,21 @@
 [package]
 name = "clacks-transport"
-version = "0.0.2"
+version = "0.0.3"
 authors = ["Aaron Gallagher <_@habnab.it>", "Connie Hilarides <connorcpu@live.com>"]
 license = "MIT/Apache-2.0"
 
 [dependencies]
-byteorder = "*"
-bytes = "*"
-chrono = "*"
-error-chain = "*"
-rand = "*"
-tokio-io = "*"
+byteorder = "1.2"
+bytes = "0.4"
+chrono = "0.4"
+error-chain = "0.11"
+rand = "0.4"
+tokio-io = "0.1"
 
 [dependencies.clacks-mtproto]
 path = "../clacks-mtproto"
-version = "0.0.2"
-features = ["rustfmt-codegen"]
+version = "0.0.3"
 
 [dependencies.clacks-crypto]
 path = "../clacks-crypto"
-version = "0.0.2"
+version = "0.0.3"

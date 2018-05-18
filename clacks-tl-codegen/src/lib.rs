@@ -1,5 +1,8 @@
 #![recursion_limit = "128"]
 
+#[cfg(feature = "rustfmt-codegen")]
+extern crate rustfmt;
+
 #[macro_use] extern crate derivative;
 #[macro_use] extern crate quote;
 extern crate pom;
@@ -1614,7 +1617,35 @@ impl Constructors<TypeIR, FieldIR> {
     }
 }
 
-pub fn generate_code_for(input: &str) -> String {
+#[cfg(feature = "rustfmt-codegen")]
+fn reformat(source: String) -> std::io::Result<String> {
+    let mut config: rustfmt::config::Config = Default::default();
+    {
+        let mut set = config.set();
+        set.error_on_line_overflow(false);
+        set.array_width(200); 
+        set.fn_call_width(200);
+        set.max_width(200);
+        set.struct_lit_width(200);
+        set.struct_variant_width(200);
+    }
+    let outputs = match rustfmt::format_input::<std::io::Sink>(rustfmt::Input::Text(source), &config, None) {
+        Ok((_, outputs, _)) => outputs,
+        Err((e, _)) => return Err(e),
+    };
+    let (_, string_buf) = outputs.into_iter()
+        .filter(|&(ref name, _)| name == "stdin")
+        .next()
+        .unwrap();
+    Ok(format!("{}", string_buf))
+}
+
+#[cfg(not(feature = "rustfmt-codegen"))]
+fn reformat(source: String) -> std::io::Result<String> {
+    Ok(source)
+}
+
+pub fn generate_code_for(input: &str) -> std::io::Result<String> {
     let constructors = {
         let mut items = parser::parse_string(input).unwrap();
         filter_items(&mut items);
@@ -1631,8 +1662,8 @@ pub fn generate_code_for(input: &str) -> String {
 
     let items = constructors.as_tokens();
 
-    quote!(
+    reformat(quote!(
         #prelude
         #items
-    ).to_string()
+    ).to_string())
 }
