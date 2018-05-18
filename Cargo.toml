@@ -1,8 +1,8 @@
 [workspace]
 members = [
-    "clacks-crypto",
-    "clacks-demos",
-    "clacks-mtproto",
-    "clacks-tl-codegen",
-    "clacks-transport",
+    "clacks_crypto",
+    "clacks_demos",
+    "clacks_mtproto",
+    "clacks_tl_codegen",
+    "clacks_transport",
 ]

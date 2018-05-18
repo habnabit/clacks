@@ -1,15 +1,21 @@
 [package]
-name = "clacks-crypto"
+name = "clacks_transport"
 version = "0.0.3"
 authors = ["Aaron Gallagher <_@habnab.it>", "Connie Hilarides <connorcpu@live.com>"]
 license = "MIT/Apache-2.0"
 
 [dependencies]
 byteorder = "1.2"
+bytes = "0.4"
+chrono = "0.4"
 error-chain = "0.11"
-openssl = "0.10"
 rand = "0.4"
+tokio-io = "0.1"
 
-[dependencies.clacks-mtproto]
-path = "../clacks-mtproto"
+[dependencies.clacks_mtproto]
+path = "../clacks_mtproto"
+version = "0.0.3"
+
+[dependencies.clacks_crypto]
+path = "../clacks_crypto"
 version = "0.0.3"
