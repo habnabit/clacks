@@ -3,6 +3,7 @@ name = "clacks_transport"
 version = "0.0.3"
 authors = ["Aaron Gallagher <_@habnab.it>", "Connie Hilarides <connorcpu@live.com>"]
 license = "MIT/Apache-2.0"
+description = "telegram's TCP transport encoding"
 
 [dependencies]
 byteorder = "1.2"
