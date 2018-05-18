@@ -1654,7 +1654,7 @@ pub fn generate_code_for(input: &str) -> std::io::Result<String> {
 
     let layer = constructors.layer as i32;
     let prelude = quote! {
-        #![allow(non_camel_case_types)]
+        #![allow(non_camel_case_types, non_snake_case)]
         pub use mtproto_prelude::*;
 
         pub const LAYER: i32 = #layer;

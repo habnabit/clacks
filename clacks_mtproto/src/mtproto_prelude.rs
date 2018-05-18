@@ -1,3 +1,5 @@
+#![allow(non_camel_case_types)]
+
 use ::{AnyBoxedSerialize, BareDeserialize, BareSerialize, BoxedDeserialize, BoxedSerialize, ConstructorNumber, Deserializer, Result, Serializer};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use extfmt::Hexlify;
