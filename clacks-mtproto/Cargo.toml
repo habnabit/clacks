@@ -7,10 +7,13 @@ description = "minimal wrappers for telegram's mtproto serialization"
 
 [dependencies]
 byteorder = "1.2"
+erased-serde = "*"
 error-chain = "0.11"
 extfmt = "0.1"
 lazy_static = "*"
 rand = "*"
+serde = "1.0"
+serde_derive = "1.0"
 
 [build-dependencies.clacks-tl-codegen]
 path = "../clacks-tl-codegen"

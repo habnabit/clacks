@@ -11,6 +11,8 @@ error-chain = "*"
 futures = "0.1"
 futures-await = "*"
 rand = "*"
+serde = "1.0"
+serde_json = "*"
 tokio = "*"
 tokio-io = "*"
 
@@ -26,3 +28,6 @@ version = "0.0.2"
 [dependencies.clacks-transport]
 path = "../clacks-transport"
 version = "0.0.2"
+
+[dependencies.sexpr]
+git = "https://github.com/zshipko/sexpr"

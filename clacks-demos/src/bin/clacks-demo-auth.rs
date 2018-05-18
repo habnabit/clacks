@@ -7,6 +7,9 @@ extern crate clacks_mtproto;
 extern crate clacks_transport;
 extern crate futures_await as futures;
 extern crate rand;
+extern crate serde;
+extern crate serde_json;
+extern crate sexpr;
 extern crate tokio;
 extern crate tokio_io;
 
@@ -15,8 +18,71 @@ use clacks_mtproto::{BoxedDeserialize, BoxedSerialize, IntoBoxed, mtproto};
 use futures::{Future, Sink, Stream, future};
 use futures::prelude::*;
 use rand::Rng;
+use std::io;
 use tokio_io::{AsyncRead, AsyncWrite};
 
+
+struct ElispFormatter(sexpr::ser::CompactFormatter);
+
+macro_rules! enquote_integer {
+    ($ty:ident, $meth:ident) => {
+
+        fn $meth<W: ?Sized>(&mut self, writer: &mut W, value: $ty) -> io::Result<()>
+            where W: io::Write,
+        {
+            self.enquote(writer, |this, w| (this.0).$meth(w, value))
+        }
+
+    };
+}
+
+impl sexpr::ser::Formatter for ElispFormatter {
+    enquote_integer!(u32, write_u32);
+    enquote_integer!(i32, write_i32);
+    enquote_integer!(u64, write_u64);
+    enquote_integer!(i64, write_i64);
+
+    fn begin_object_key<W: ?Sized>(&mut self, writer: &mut W, first: bool) -> io::Result<()>
+        where W: io::Write,
+    {
+        if first {
+            writer.write_all(b"(")
+        } else {
+            writer.write_all(b" (")
+        }
+    }
+
+    fn begin_object_value<W: ?Sized>(&mut self, writer: &mut W) -> io::Result<()>
+        where W: io::Write,
+    {
+        writer.write_all(b". ")
+    }
+
+    fn end_object_value<W: ?Sized>(&mut self, writer: &mut W) -> io::Result<()>
+        where W: io::Write,
+    {
+        writer.write_all(b")")
+    }
+}
+
+impl ElispFormatter {
+    fn to_string<S>(obj: &S) -> io::Result<String>
+        where S: serde::Serialize,
+    {
+        let mut ret: Vec<u8> = vec![];
+        obj.serialize(&mut sexpr::Serializer::with_formatter(&mut ret, ElispFormatter(sexpr::ser::CompactFormatter)))?;
+        Ok(String::from_utf8(ret).unwrap())
+    }
+
+    fn enquote<W: ?Sized, F>(&mut self, writer: &mut W, func: F) -> io::Result<()>
+        where W: io::Write, F: FnOnce(&mut Self, &mut W) -> io::Result<()>,
+    {
+        writer.write_all(b"\"")?;
+        func(self, writer)?;
+        writer.write_all(b"\"")?;
+        Ok(())
+    }
+}
 
 fn into_error<T>(x: T) -> clacks_transport::error::Error
     where T: Into<clacks_transport::error::Error>
@@ -37,7 +103,7 @@ impl<S> TelegramFramed<S>
     fn new(session_id: i64, stream: S) -> Self {
         let framed = stream.framed(clacks_transport::TelegramCodec::new());
         let session = clacks_transport::session::Session::new(session_id, clacks_transport::session::AppId {
-            api_id: 0, 
+            api_id: 0,
             api_hash: "".into(),
         });
         TelegramFramed { framed, session }
@@ -65,7 +131,10 @@ impl<S> TelegramFramed<S>
         let processed = self.session.process_message(&received)?;
         let parsed = mtproto::TLObject::boxed_deserialized_from_bytes(&processed.payload)?;
         println!("got: {:?}", parsed);
-        println!("downcast: {:?}", parsed.downcast::<mtproto::manual::MessageContainer>());
+        let result = parsed.downcast::<mtproto::manual::MessageContainer>().expect("not a container");
+        println!("downcast: {:?}", result);
+        println!("---sexpr---\n{}\n", ElispFormatter::to_string(&result).expect("not serialized"));
+        println!("---json---\n{}\n---", serde_json::to_string_pretty(&result).expect("not serialized"));
         panic!();
         //Ok((TelegramFramed { framed, session: self.session }, parsed))
     }
@@ -77,7 +146,7 @@ fn u32_bytes(n: u32) -> mtproto::bytes {
     ret.into()
 }
 
-#[async] 
+#[async]
 fn kex<S>(stream: S) -> clacks_transport::error::Result<()>
     where S: AsyncRead + AsyncWrite + 'static,
 {
@@ -92,7 +161,7 @@ fn kex<S>(stream: S) -> clacks_transport::error::Result<()>
     let (p, q) = clacks_crypto::asymm::decompose_pq(pq_int)?;
     let (pubkey, public_key_fingerprint) = clacks_crypto::asymm::find_first_key(&pq.server_public_key_fingerprints)?.unwrap();
     let new_nonce = rng.gen();
-    let inner = mtproto::p_q_inner_data::P_Q_inner_data { 
+    let inner = mtproto::p_q_inner_data::P_Q_inner_data {
         nonce, new_nonce, server_nonce,
         p: u32_bytes(p), q: u32_bytes(q),
         pq: pq.pq,
@@ -153,7 +222,7 @@ fn kex<S>(stream: S) -> clacks_transport::error::Result<()>
     let init = mtproto::rpc::invokeWithLayer {
         layer: mtproto::LAYER,
         query: mtproto::rpc::initConnection {
-            api_id: 0, 
+            api_id: 0,
             device_model: "test".into(),
             system_version: "test".into(),
             app_version: "0.0.1".into(),

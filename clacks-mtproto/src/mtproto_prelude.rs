@@ -2,6 +2,7 @@ use ::{AnyBoxedSerialize, BareDeserialize, BareSerialize, BoxedDeserialize, Boxe
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use extfmt::Hexlify;
 use rand::{Rand, Rng};
+use serde;
 use std::fmt;
 use std::io::{Read, Write};
 use std::marker::PhantomData;
@@ -28,6 +29,14 @@ macro_rules! impl_byteslike {
 
         impl ::std::ops::DerefMut for $ty {
             fn deref_mut(&mut self) -> &mut [u8] { &mut self.0 }
+        }
+
+        impl serde::Serialize for $ty {
+            fn serialize<S>(&self, serializer: S) -> ::std::result::Result<S::Ok, S::Error>
+                where S: serde::Serializer,
+            {
+                serializer.serialize_bytes(&self.0)
+            }
         }
 
     };
@@ -142,6 +151,14 @@ impl BoxedSerialize for TLObject {
     }
 }
 
+impl serde::Serialize for TLObject {
+    fn serialize<S>(&self, serializer: S) -> ::std::result::Result<S::Ok, S::Error>
+        where S: serde::Serializer,
+    {
+        serde::Serialize::serialize(&self.0, serializer)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct LengthPrefixed<T>(pub T);
 
@@ -170,6 +187,16 @@ impl<T> BareSerialize for LengthPrefixed<T>
         ser.write_i32::<LittleEndian>(inner.len() as i32)?;
         ser.write(&inner)?;
         Ok(())
+    }
+}
+
+impl<T> serde::Serialize for LengthPrefixed<T>
+    where T: serde::Serialize,
+{
+    fn serialize<S>(&self, serializer: S) -> ::std::result::Result<S::Ok, S::Error>
+        where S: serde::Serializer,
+    {
+        serde::Serialize::serialize(&self.0, serializer)
     }
 }
 
@@ -253,6 +280,21 @@ impl<Det, T> fmt::Debug for Vector<Det, T>
 {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "Vector({:?})", self.0)
+    }
+}
+
+impl<Det, T> serde::Serialize for Vector<Det, T>
+    where T: serde::Serialize,
+{
+    fn serialize<S>(&self, serializer: S) -> ::std::result::Result<S::Ok, S::Error>
+        where S: serde::Serializer,
+    {
+        use serde::ser::SerializeSeq;
+        let mut seq = serializer.serialize_seq(Some(self.0.len()))?;
+        for item in &self.0 {
+            seq.serialize_element(item)?;
+        }
+        seq.end()
     }
 }
 

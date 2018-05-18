@@ -1,10 +1,13 @@
 #![recursion_limit = "80000"]
 
+#[macro_use] extern crate erased_serde;
 #[macro_use] extern crate error_chain;
 #[macro_use] extern crate lazy_static;
+#[macro_use] extern crate serde_derive;
 extern crate byteorder;
 extern crate extfmt;
 extern crate rand;
+extern crate serde;
 
 pub mod error;
 pub mod mtproto;
@@ -79,7 +82,7 @@ pub trait BoxedDeserializeDynamic: BoxedDeserialize {
     fn boxed_deserialize_to_box(id: ConstructorNumber, de: &mut Deserializer) -> Result<mtproto::TLObject>;
 }
 
-impl<D> BoxedDeserializeDynamic for D 
+impl<D> BoxedDeserializeDynamic for D
     where D: BoxedDeserialize + AnyBoxedSerialize,
 {
     fn boxed_deserialize_to_box(id: ConstructorNumber, de: &mut Deserializer) -> Result<mtproto::TLObject> {
@@ -88,10 +91,6 @@ impl<D> BoxedDeserializeDynamic for D
 }
 
 pub type DynamicDeserializer = fn(ConstructorNumber, &mut Deserializer) -> Result<mtproto::TLObject>;
-
-pub trait Function: BoxedSerialize {
-    type Reply: BoxedDeserialize;
-}
 
 pub struct Serializer<'w> {
     writer: &'w mut io::Write,
@@ -154,12 +153,18 @@ pub trait IntoBoxed: BareSerialize {
     fn into_boxed(self) -> Self::Boxed;
 }
 
-pub trait AnyBoxedSerialize: Any + BoxedSerialize {
+pub trait AnyBoxedSerialize: Any + BoxedSerialize + erased_serde::Serialize {
     fn as_any(&self) -> &Any;
     fn into_boxed_any(self: Box<Self>) -> Box<Any>;
 }
 
-impl<T: Any + BoxedSerialize> AnyBoxedSerialize for T {
+impl<T: Any + BoxedSerialize + erased_serde::Serialize> AnyBoxedSerialize for T {
     fn as_any(&self) -> &Any { self }
     fn into_boxed_any(self: Box<Self>) -> Box<Any> { self }
+}
+
+serialize_trait_object!(AnyBoxedSerialize);
+
+pub trait Function: AnyBoxedSerialize + serde::Serialize {
+    type Reply: BoxedDeserialize;
 }

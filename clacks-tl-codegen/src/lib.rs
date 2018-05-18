@@ -36,7 +36,7 @@ pub mod parser {
         }
 
         pub fn names_vec_mut(&mut self) -> Option<&mut Vec<String>> {
-            use self::Type::*; 
+            use self::Type::*;
             match *self {
                 Int |
                 Flags |
@@ -204,7 +204,7 @@ pub mod parser {
     fn constructor() -> Parser<u8, Constructor<Type, Field>> {
         (output_and_matched(dotted_ident()) + tl_id().opt() + fields() - seq(b" = ") + output_and_matched(ty_space_generic()) - sym(b';'))
             .map(|(((variant, tl_id), (type_parameters, fields)), output)| Constructor {
-                tl_id, type_parameters, fields, 
+                tl_id, type_parameters, fields,
                 original_variant: variant.1,
                 variant: Type::Named(variant.0),
                 original_output: output.1,
@@ -425,7 +425,7 @@ impl AllConstructors {
                         },
                         Delimiter::Functions => functions.push(Matched(c, m)),
                     }
-                }, 
+                },
                 Item::Layer(i) => ret.layer = i,
             }
         }
@@ -436,7 +436,7 @@ impl AllConstructors {
             let mut cs = cs.resolve(&resolve_map);
             for &Matched(ref c, ref m) in &cs.0 {
                 ret.items.insert(
-                    c.variant.owned_names_vec(), 
+                    c.variant.owned_names_vec(),
                     AsVariant(Matched(c.clone(), m.clone())));
             }
             ret.items.insert(cs.first_constructor().output.owned_names_vec(), AsEnum(cs));
@@ -458,9 +458,9 @@ impl AllConstructors {
 
         quote! {
 
-            lazy_static! {                
-                pub static ref DYNAMIC_DESERIALIZERS: 
-                    ::std::collections::BTreeMap<::ConstructorNumber, ::DynamicDeserializer> = 
+            lazy_static! {
+                pub static ref DYNAMIC_DESERIALIZERS:
+                    ::std::collections::BTreeMap<::ConstructorNumber, ::DynamicDeserializer> =
                 {
                     let mut ret = ::std::collections::BTreeMap::new();
                     #( #dynamic_deserializer )*
@@ -1025,7 +1025,7 @@ impl Constructor<TypeIR, FieldIR> {
             return quote!();
         }
         let tys = self.type_parameters.iter().map(FieldIR::name);
-        quote! { <#(#tys: ::BoxedSerialize),*> }
+        quote! { <#(#tys: ::AnyBoxedSerialize),*> }
     }
 
     fn as_struct_determine_flags(&self, field_prefix: quote::Tokens) -> Option<quote::Tokens> {
@@ -1064,7 +1064,7 @@ impl Constructor<TypeIR, FieldIR> {
         let generics = self.generics();
         let fields = self.fields_tokens(quote! {pub}, quote! {;});
         quote! {
-            #[derive(Debug, Clone)]
+            #[derive(Debug, Clone, Serialize)]
             #[doc = #doc]
             pub struct #name #generics #fields
         }
@@ -1373,7 +1373,7 @@ impl Constructors<Type, Field> {
             self.0.iter()
                 .filter_map(|m| m.0.variant.name())
                 .fold(None, |a, b| Some(common_prefix_of(a, b)))
-        } { 
+        } {
             None | Some("") => return,
             Some(s) => s.to_string(),
         };
@@ -1603,7 +1603,7 @@ impl Constructors<TypeIR, FieldIR> {
             self.as_deserialize_match(&name));
 
         quote! {
-            #[derive(Debug, Clone)]
+            #[derive(Debug, Clone, Serialize)]
             #[doc = #doc]
             pub enum #name {
                 #( #variants , )*
