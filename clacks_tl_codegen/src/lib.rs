@@ -263,44 +263,62 @@ pub mod parser {
         sym(b'_').repeat(1..).discard()
     }
 
-    fn mixed_case_ident() -> Parser<u8, Vec<String>> {
-        let latter = (
-            (underscore() * uppercase()) |
-            (underscore() * lowercase()) |
-            ((uppercase() + lowercase()) |
-             (underscore() * uppercase() + lowercase()))
-                .map(|(lhs, rhs)| lhs + &rhs) |
-            uppercase()
-        ).map(|mut s| {
-            s.make_ascii_lowercase();
-            s
-        });
-        (lowercase().opt() + latter.repeat(0..))
-            .map(|(c, mut cs)| {
-                cs.splice(..0, c);
-                cs
-            })
+    fn mixed_case_ident() -> Parser<u8, NameChunks> {
+        ((((uppercase() + lowercase()).map(|(upper, lower)| upper + &lower)
+          | uppercase()
+          | lowercase()
+          )
+         ) - underscore().opt()
+        )
+            .repeat(1..)
+            .map(NameChunks)
     }
 
-    pub fn ident_to_snake_case(input: &str) -> Result<String, pom::Error> {
-        let mut input = pom::DataInput::new(input.as_bytes());
-        let v = mixed_case_ident().parse(&mut input)?;
-        Ok(v.join("_"))
-    }
+    #[derive(Debug, Clone)]
+    pub struct NameChunks(pub Vec<String>);
 
-    pub fn ident_to_upper_camel_case(input: &str) -> Result<String, pom::Error> {
-        let mut input = pom::DataInput::new(input.as_bytes());
-        let v = mixed_case_ident().parse(&mut input)?;
-        let mut ret = String::new();
-        for mut segment in v {
-            ret.push(segment.as_bytes()[0].to_ascii_uppercase() as char);
-            ret.push_str(&segment[1..]);
+    impl NameChunks {
+        pub fn from_name(name: &str) -> Result<Self, pom::Error> {
+            let mut input = pom::DataInput::new(name.as_bytes());
+            (mixed_case_ident() - end()).parse(&mut input)
         }
-        Ok(ret)
+
+        pub fn as_snake_case(&self) -> String {
+            let names: Vec<String> = self.0.iter()
+                .map(|s| s.to_ascii_lowercase())
+                .collect();
+            names.join("_")
+        }
+
+        pub fn as_upper_camel_case(&self) -> String {
+            self.0.iter()
+                .cloned()
+                .map(|mut s| {
+                    &mut s[..1].make_ascii_uppercase();
+                    s
+                })
+                .collect()
+        }
+
+        pub fn common_prefix_of(&self, other: &Self) -> Self {
+            let index = self.0.iter()
+                .zip(&other.0)
+                .enumerate()
+                .skip_while(|&(_, (a, b))| a == b)
+                .next()
+                .map(|(e, _)| e)
+                .unwrap_or(self.0.len().min(other.0.len()));
+            NameChunks((&self.0[..index]).to_vec())
+        }
+
+        pub fn trim_common_prefix(&mut self, other: &Self) {
+            assert!(self.0.starts_with(&other.0), "{:?} not a prefix of {:?}", self, other);
+            self.0.drain(0..(other.0.len()));
+        }
     }
 }
 
-pub use parser::{Constructor, Delimiter, Field, Item, Matched, Type};
+use parser::{Constructor, Delimiter, Field, Item, Matched, NameChunks, Type};
 
 use std::collections::BTreeMap;
 use std::mem;
@@ -351,7 +369,7 @@ impl Namespace {
                         .or_insert_with(|| AnotherNamespace(Default::default()))
                 } {
                     &mut AnotherNamespace(ref mut ns) => ns,
-                    _ => panic!("duplicate namespace item {:?} {:?}", names, name),
+                    other => panic!("duplicate namespace item {} {:?} {:?}", name, other, names),
                 }
             })
     }
@@ -433,9 +451,17 @@ impl AllConstructors {
             }
         }
         let mut resolve_map: TypeResolutionMap = Default::default();
-        for (_, mut cs) in constructorses {
+        for (_, cs) in &mut constructorses {
             let base_ns = cs.first_constructor().output.namespaces().to_vec();
-            cs.trim_common_prefixes(&base_ns, &mut resolve_map);
+            cs.fix_names(&base_ns, &mut resolve_map);
+        }
+        for &mut Matched(ref mut c, _) in &mut functions {
+            camelize(&mut resolve_map, &mut c.variant, |_, ns| {
+                ns.insert(0, "rpc".to_string());
+                false
+            });
+        }
+        for (_, cs) in constructorses {
             let mut cs = cs.resolve(&resolve_map);
             for &Matched(ref c, ref m) in &cs.0 {
                 ret.items.insert(
@@ -446,9 +472,7 @@ impl AllConstructors {
         }
         for Matched(c, m) in functions {
             let c = c.resolve(Delimiter::Functions, &resolve_map);
-            let mut ns = c.variant.owned_names_vec();
-            ns.insert(0, no_conflict_ident("rpc"));
-            ret.items.insert(ns, AsFunction(Matched(c, m)));
+            ret.items.insert(c.variant.owned_names_vec(), AsFunction(Matched(c, m)));
         }
         ret
     }
@@ -1356,6 +1380,21 @@ fn common_prefix_of<'a>(a: Option<&'a str>, b: &'a str) -> &'a str {
     &ret[..min_len]
 }
 
+fn camelize<F>(resolve_map: &mut TypeResolutionMap, ty: &mut Type, additional_correction: F) -> NameChunks
+    where F: FnOnce(&mut NameChunks, &mut Vec<String>) -> bool
+{
+    let names = ty.names_vec_mut().unwrap();
+    let fixup_key = names.clone();
+    let name = names.pop().unwrap();
+    let mut new_name = NameChunks::from_name(&name).unwrap();
+    let force_bare = additional_correction(&mut new_name, names);
+    names.push(new_name.as_upper_camel_case());
+    let type_ir = TypeIR::from_names_and_hint(&names, force_bare);
+    resolve_map.insert(fixup_key, type_ir.clone());
+    resolve_map.insert(names.clone(), type_ir);
+    new_name
+}
+
 impl<Ty, Fi> Constructors<Ty, Fi> {
     fn first_constructor(&self) -> &Constructor<Ty, Fi> {
         &self.0[0].0
@@ -1371,43 +1410,34 @@ impl Constructors<Type, Field> {
         })
     }
 
-    fn trim_common_prefixes(&mut self, base_ns: &[String], resolve_map: &mut TypeResolutionMap) {
-        let common_prefix = match {
-            self.0.iter()
-                .filter_map(|m| m.0.variant.name())
-                .fold(None, |a, b| Some(common_prefix_of(a, b)))
-        } {
-            None | Some("") => return,
-            Some(s) => s.to_string(),
+    fn fix_names(&mut self, base_ns: &[String], resolve_map: &mut TypeResolutionMap) {
+        let output_name = camelize(resolve_map, &mut self.0[0].0.output, |_, _| false);
+
+        let common_prefix = self.0.iter()
+            .filter_map(|m| m.0.variant.name())
+            .map(|n| NameChunks::from_name(n).unwrap())
+            .fold(None, |a_opt: Option<NameChunks>, b| {
+                Some(a_opt.map(|a| a.common_prefix_of(&b)).unwrap_or(b))
+            })
+            .unwrap_or_else(|| NameChunks(vec![]));
+        let common_module = if common_prefix.0.is_empty() {
+            output_name.as_snake_case()
+        } else {
+            common_prefix.as_snake_case()
         };
-        let common_module = &common_prefix;
         for &mut Matched(ref mut c, _) in &mut self.0 {
-
-            if let Some(variant) = c.variant.names_vec_mut() {
-                if !variant.starts_with(&base_ns) {
-                    variant.splice(..0, base_ns.iter().cloned());
+            camelize(resolve_map, &mut c.variant, |name, names| {
+                if !names.starts_with(base_ns) {
+                    names.splice(..0, base_ns.iter().cloned());
                 }
-            }
-
-            let names = match c.variant.names_vec_mut() {
-                None => continue,
-                Some(v) => v,
-            };
-            let fixup_key = names.clone();
-            if !names.starts_with(base_ns) {
-                names.splice(..0, base_ns.iter().cloned());
-            }
-            let last = names.pop().unwrap();
-            let was_bare = is_first_char_lowercase(&last);
-            let last = match &last[common_prefix.len()..] {
-                "" => c.output.name().unwrap(),
-                s => s,
-            }.to_string();
-            names.push(common_module.to_string());
-            names.push(last);
-            let type_ir = TypeIR::from_names_and_hint(&names, was_bare);
-            resolve_map.insert(fixup_key, type_ir.clone());
-            resolve_map.insert(names.clone(), type_ir);
+                names.push(common_module.clone());
+                let was_bare = is_first_char_lowercase(&name.0[0]);
+                name.trim_common_prefix(&common_prefix);
+                if name.0.is_empty() {
+                    name.clone_from(&common_prefix);
+                }
+                was_bare
+            });
         }
     }
 
@@ -1623,7 +1653,7 @@ fn reformat(source: String) -> std::io::Result<String> {
     {
         let mut set = config.set();
         set.error_on_line_overflow(false);
-        set.array_width(200); 
+        set.array_width(200);
         set.fn_call_width(200);
         set.max_width(200);
         set.struct_lit_width(200);
