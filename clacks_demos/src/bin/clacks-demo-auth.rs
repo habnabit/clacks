@@ -153,7 +153,7 @@ fn kex<S>(stream: S) -> clacks_transport::error::Result<()>
     let mut rng = rand::OsRng::new().unwrap();
     let framed = TelegramFramed::new(rng.gen(), stream);
     let nonce = rng.gen();
-    let (framed, mtproto::ResPQ::ResPQ(pq)) = await!(framed.send_and_await_reply(mtproto::rpc::req_pq { nonce }))?;
+    let (framed, mtproto::ResPQ::ResPQ(pq)) = await!(framed.send_and_await_reply(mtproto::rpc::ReqPq { nonce }))?;
     println!("got back: {:#?}", pq);
     assert_eq!(nonce, pq.nonce);
     let server_nonce = pq.server_nonce;
@@ -161,16 +161,15 @@ fn kex<S>(stream: S) -> clacks_transport::error::Result<()>
     let (p, q) = clacks_crypto::asymm::decompose_pq(pq_int)?;
     let (pubkey, public_key_fingerprint) = clacks_crypto::asymm::find_first_key(&pq.server_public_key_fingerprints)?.unwrap();
     let new_nonce = rng.gen();
-    let inner = mtproto::p_q_inner_data::P_Q_inner_data {
+    let inner = mtproto::p_q_inner_data::PQInnerData {
         nonce, new_nonce, server_nonce,
         p: u32_bytes(p), q: u32_bytes(q),
         pq: pq.pq,
-    };
+    }.into_boxed();
     let aes = clacks_crypto::symm::AesParams::from_pq_inner_data(&inner)?;
     println!("inner: {:#?}", inner);
-    let encrypted_data = pubkey.encrypt(
-        &inner.into_boxed().boxed_serialized_bytes()?)?.into();
-    let dh_req = mtproto::rpc::req_DH_params {
+    let encrypted_data = pubkey.encrypt(&inner.boxed_serialized_bytes()?)?.into();
+    let dh_req = mtproto::rpc::ReqDHParams {
         nonce, server_nonce, public_key_fingerprint, encrypted_data,
         p: u32_bytes(p), q: u32_bytes(q),
     };
@@ -178,23 +177,23 @@ fn kex<S>(stream: S) -> clacks_transport::error::Result<()>
     let (framed, dh_params) = await!(framed.send_and_await_reply(dh_req))?;
     println!("got back: {:#?}", dh_params);
     let dh_params = match dh_params {
-        mtproto::Server_DH_Params::ok(x) => x,
+        mtproto::ServerDHParams::Ok(x) => x,
         _ => unimplemented!(),
     };
     let decrypted = aes.ige_decrypt(&dh_params.encrypted_answer)?;
-    let mtproto::Server_DH_inner_data::Server_DH_inner_data(server_dh_data) = {
+    let server_dh_data = {
         let (sha_part, data_part) = decrypted.split_at(20);
-        mtproto::Server_DH_inner_data::boxed_deserialized_from_bytes(&data_part)?
+        mtproto::ServerDHInnerData::boxed_deserialized_from_bytes(&data_part)?
     };
     println!("dh data: {:#?}", server_dh_data);
     let (auth_key, g_b) = clacks_crypto::asymm::calculate_auth_key(&server_dh_data)?;
-    let inner = mtproto::client_DH_inner_data::Client_DH_Inner_Data {
+    let inner = mtproto::client_dh_inner_data::ClientDHInnerData {
         nonce, server_nonce, g_b,
         retry_id: 0,
     }.into_boxed();
     println!("inner: {:#?}", inner);
     let encrypted_data = aes.ige_encrypt(&inner.boxed_serialized_bytes()?, true)?.into();
-    let set_dh = mtproto::rpc::set_client_DH_params {
+    let set_dh = mtproto::rpc::SetClientDHParams {
         nonce, server_nonce, encrypted_data,
     };
     println!("set_dh: {:#?}", set_dh);
@@ -202,7 +201,7 @@ fn kex<S>(stream: S) -> clacks_transport::error::Result<()>
     println!("answer: {:#?}", answer);
     let expected_new_nonce_hash1 = auth_key.new_nonce_hash(1, new_nonce)?;
     match answer {
-        mtproto::Set_client_DH_params_answer::ok(ref n) if n.new_nonce_hash1 == expected_new_nonce_hash1 => (),
+        mtproto::SetClientDHParamsAnswer::Ok(ref n) if n.new_nonce_hash1 == expected_new_nonce_hash1 => (),
         _ => unimplemented!(),
     }
     let mut new_salt = [0u8; 8];
@@ -211,17 +210,13 @@ fn kex<S>(stream: S) -> clacks_transport::error::Result<()>
     }
     println!("results: {:?} {:?}", auth_key, new_salt);
     let now = chrono::Utc::now();
-    let salt = mtproto::future_salt::FutureSalt {
-        salt: LittleEndian::read_i64(&new_salt),
-        valid_since: now.timestamp() as i32,
-        valid_until: (now + chrono::Duration::minutes(10)).timestamp() as i32,
-    }.into_boxed();
+    let salt = clacks_transport::session::future_salt_from_negotiated_salt(LittleEndian::read_i64(&new_salt));
     framed.session.adopt_key(auth_key);
     framed.session.add_server_salts(std::iter::once(salt));
     println!("session: {:#?}", framed.session);
-    let init = mtproto::rpc::invokeWithLayer {
+    let init = mtproto::rpc::InvokeWithLayer {
         layer: mtproto::LAYER,
-        query: mtproto::rpc::initConnection {
+        query: mtproto::rpc::InitConnection {
             api_id: 0,
             device_model: "test".into(),
             system_version: "test".into(),
@@ -229,10 +224,10 @@ fn kex<S>(stream: S) -> clacks_transport::error::Result<()>
             lang_code: "en".into(),
             system_lang_code: "en".into(),
             lang_pack: "".into(),
-            query: mtproto::rpc::help::getConfig,
+            query: mtproto::rpc::help::GetConfig,
         }
     };
-    let send_code = mtproto::rpc::auth::sendCode {
+    let send_code = mtproto::rpc::auth::SendCode {
         allow_flashcall: false,
         phone_number: "".into(),
         current_number: None,

@@ -30,11 +30,11 @@ struct Salt {
 }
 
 impl From<mtproto::FutureSalt> for Salt {
-    fn from(mtproto::FutureSalt::FutureSalt(fs): mtproto::FutureSalt) -> Self {
+    fn from(fs: mtproto::FutureSalt) -> Self {
         Salt {
-            valid_since: Utc.timestamp(fs.valid_since as i64, 0),
-            valid_until: Utc.timestamp(fs.valid_until as i64, 0),
-            salt: fs.salt,
+            valid_since: Utc.timestamp(*fs.valid_since() as i64, 0),
+            valid_until: Utc.timestamp(*fs.valid_until() as i64, 0),
+            salt: *fs.salt(),
         }
     }
 }
@@ -118,7 +118,7 @@ impl Session {
         self.to_ack.push(id);
     }
 
-    fn pack_message_container<I>(&mut self, payloads: I) -> mtproto::manual::msg_container::MessageContainer
+    fn pack_message_container<I>(&mut self, payloads: I) -> mtproto::manual::MessageContainer
         where I: IntoIterator<Item = (bool, mtproto::TLObject)>,
     {
         let messages: Vec<_> = payloads.into_iter()
@@ -130,9 +130,9 @@ impl Session {
                 }
             })
             .collect();
-        mtproto::manual::msg_container::MessageContainer {
+        mtproto::manual::msg_container::MsgContainer {
             messages: messages.into(),
-        }
+        }.into_boxed()
     }
 
     fn fresh_auth_key(&self) -> Result<AuthKey> {
@@ -163,8 +163,8 @@ impl Session {
         }.into_boxed());
         let combined = self.pack_message_container(vec![(false, acks), (true, payload)]);
         // The message id of the interior message which was 'payload'.
-        let message_id = combined.messages.0[1].msg_id;
-        let mut ret = self.encrypted_payload_inner(mtproto::TLObject::new(combined.into_boxed()), false)?;
+        let message_id = combined.messages()[1].msg_id;
+        let mut ret = self.encrypted_payload_inner(mtproto::TLObject::new(combined), false)?;
         ret.message_id = message_id;
         Ok(ret)
     }
@@ -268,13 +268,11 @@ impl Session {
     }
 }
 
-// impl FutureSalt {
-//     pub fn from_negotiated_salt(server_salt: i64) -> Self {
-//         let time = Utc::now();
-//         FutureSalt {
-//             valid_since: time.timestamp() as i32,
-//             valid_until: (time + Duration::minutes(10)).timestamp() as i32,
-//             salt: server_salt,
-//         }
-//     }
-// }
+pub fn future_salt_from_negotiated_salt(salt: i64) -> mtproto::FutureSalt {
+    let time = Utc::now();
+    mtproto::future_salt::FutureSalt {
+        salt,
+        valid_since: time.timestamp() as i32,
+        valid_until: (time + Duration::minutes(10)).timestamp() as i32,
+    }.into_boxed()
+}

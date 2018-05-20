@@ -42,13 +42,13 @@ impl AesParams {
         self.run_ige(encrypted, symm::Mode::Decrypt)
     }
 
-    pub fn from_pq_inner_data(data: &mtproto::p_q_inner_data::P_Q_inner_data) -> Result<AesParams> {
-        let sha1_a = sha1_bytes(&[&data.new_nonce, &data.server_nonce])?;
-        let sha1_b = sha1_bytes(&[&data.server_nonce, &data.new_nonce])?;
-        let sha1_c = sha1_bytes(&[&data.new_nonce, &data.new_nonce])?;
+    pub fn from_pq_inner_data(data: &mtproto::PQInnerData) -> Result<AesParams> {
+        let sha1_a = sha1_bytes(&[data.new_nonce(), data.server_nonce()])?;
+        let sha1_b = sha1_bytes(&[data.server_nonce(), data.new_nonce()])?;
+        let sha1_c = sha1_bytes(&[data.new_nonce(), data.new_nonce()])?;
         let mut ret: AesParams = Default::default();
         set_slice_parts(&mut ret.key, &[&sha1_a, &sha1_b[..12]]);
-        set_slice_parts(&mut ret.iv, &[&sha1_b[12..], &sha1_c, &data.new_nonce[..4]]);
+        set_slice_parts(&mut ret.iv, &[&sha1_b[12..], &sha1_c, &data.new_nonce()[..4]]);
         Ok(ret)
     }
 }
@@ -186,7 +186,7 @@ impl AuthKey {
     }
 
     pub fn bind_temp_auth_key<R: Rng>(self, temp_key: &AuthKey, expires_at: i32, message_id: i64, rng: &mut R)
-                                      -> Result<(i64, mtproto::rpc::auth::bindTempAuthKey)> {
+                                      -> Result<(i64, mtproto::rpc::auth::BindTempAuthKey)> {
         let nonce: i64 = rng.gen();
         let temp_session_id: i64 = rng.gen();
         let inner = OutboundEncrypted {
@@ -201,7 +201,7 @@ impl AuthKey {
                 temp_session_id: temp_session_id,
             }.into_boxed())).into(),
         };
-        Ok((temp_session_id, mtproto::rpc::auth::bindTempAuthKey {
+        Ok((temp_session_id, mtproto::rpc::auth::BindTempAuthKey {
             nonce, expires_at,
             perm_auth_key_id: self.fingerprint,
             encrypted_message: mtproto::bytes(self.encrypt_message(inner)?),

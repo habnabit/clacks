@@ -74,13 +74,11 @@ impl RsaPublicKey {
     }
 }
 
-pub fn calculate_auth_key(&mtproto::server_DH_inner_data::Server_DH_inner_data {
-    g, ref dh_prime, ref g_a, ..
-}: &mtproto::server_DH_inner_data::Server_DH_inner_data) -> Result<(AuthKey, mtproto::bytes)> {
+pub fn calculate_auth_key(data: &mtproto::ServerDHInnerData) -> Result<(AuthKey, mtproto::bytes)> {
     let mut ctx = bn::BigNumContext::new()?;
-    let g = bn::BigNum::from_u32(g as u32)?;
-    let dh_prime = bn::BigNum::from_slice(dh_prime)?;
-    let g_a = bn::BigNum::from_slice(g_a)?;
+    let g = bn::BigNum::from_u32(*data.g() as u32)?;
+    let dh_prime = bn::BigNum::from_slice(data.dh_prime())?;
+    let g_a = bn::BigNum::from_slice(data.g_a())?;
     loop {
         let mut b = bn::BigNum::new()?;
         b.rand(2048, bn::MsbOption::MAYBE_ZERO, false)?;
