@@ -1,0 +1,18 @@
+[package]
+name = "kabuki"
+version = "0.0.1"
+authors = ["Carl Lerche <me@carllerche.com>"]
+description = "Name reservation"
+license = "MIT"
+
+[dependencies]
+futures = "0.1"
+tokio-core = "0.1"
+futures-threadpool = "0.1"
+futures-mpsc = "0.1"
+scoped-tls = "0.1.0"
+
+[dependencies.futures-spawn]
+version = "0.1"
+default-features = false
+features = ["use_std", "tokio"]
