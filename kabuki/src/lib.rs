@@ -27,12 +27,13 @@ extern crate futures_spawn;
 extern crate futures_mpsc;
 #[macro_use]
 extern crate scoped_tls;
-extern crate tokio_core;
+extern crate tokio_service;
 
-use futures::{Future, Stream, IntoFuture, Async, AsyncSink, Sink, Poll};
+use futures::{Future, Stream, IntoFuture, Async, AsyncSink, Sink, Poll, future};
 use futures::sync::oneshot;
 use futures_spawn::Spawn;
 use futures_mpsc as mpsc;
+use tokio_service::Service;
 
 use std::mem;
 use std::marker::PhantomData;
@@ -81,17 +82,6 @@ pub trait Actor {
     fn call(&mut self, req: Self::Request) -> Self::Future;
 }
 
-/// An indication of whether to make a tail call back into the same actor or
-/// return a response.
-pub enum TailCall<R, U> {
-    /// Make another call into the actor. This will use the same processing
-    /// slot as the last call, so the new call won't have to wait or use up
-    /// another processing slot.
-    Call(R),
-    /// The call has completed.
-    Complete(U),
-}
-
 /// An actor implemented by a closure.
 pub struct ActorFn<F, T> {
     f: F,
@@ -133,21 +123,21 @@ pub struct Builder {
     in_flight: usize,
 }
 
-struct ActorAndOutbox<A: Actor, U> {
+struct ActorAndOutbox<A: Actor> {
     actor: A,
-    outbox: Outbox<A::Request, U, A::Error>,
+    outbox: Outbox<A::Request, A::Response, A::Error>,
 }
 
 /// Manages the runtime state of an `Actor`.
-pub struct ActorCell<A: Actor, U: 'static> {
+pub struct ActorCell<A: Actor> {
     // The actor value
-    actor: ActorAndOutbox<A, U>,
+    actor: ActorAndOutbox<A>,
 
     // Current state of the actor
     state: ActorStatePriv,
 
     // The actors inbox
-    rx: mpsc::Receiver<Envelope<A::Request, U, A::Error>>,
+    rx: mpsc::Receiver<Envelope<A::Request, A::Response, A::Error>>,
 
     // A slab of futures that are being executed. Each slot in this vector is
     // either an active future or a pointer to the next empty slot. This is used
@@ -156,7 +146,7 @@ pub struct ActorCell<A: Actor, U: 'static> {
     // The `next_future` field is the next slot in the `futures` array that's a
     // `Slot::Next` variant. If it points to the end of the array then the array
     // is full.
-    futures: Vec<Slot<Processing<A, U>>>,
+    futures: Vec<Slot<Processing<A>>>,
     next_future: usize,
 
     // Number of active futures running in the `futures` slab
@@ -164,8 +154,6 @@ pub struct ActorCell<A: Actor, U: 'static> {
 
     // Maximum number of in-flight futures
     max: usize,
-
-    trampoline: fn(A::Response) -> TailCall<A::Request, U>,
 }
 
 /// The sender to a potentially running actor
@@ -178,12 +166,10 @@ impl<T, U, E> Clone for Outbox<T, U, E> {
 }
 
 /// Handle to an actor, used to send messages
-pub enum ActorRef<T, U, E> {
-    /// All messages sent will be dropped immediately
-    Null(fn() -> U),
-    /// The sender to a potentially running actor
-    Outbox(Outbox<T, U, E>),
-}
+pub struct ActorRef<T, U, E>(Outbox<T, U, E>);
+
+/// The `ActorRef` for a given `Actor`
+pub type ActorRefOf<A> = ActorRef<<A as Actor>::Request, <A as Actor>::Response, <A as Actor>::Error>;
 
 /// Used to represent `call` errors
 pub enum CallError<T> {
@@ -200,9 +186,9 @@ struct Envelope<T, U, E> {
     ret: oneshot::Sender<Result<U, E>>,
 }
 
-struct Processing<A: Actor, U: 'static> {
+struct Processing<A: Actor> {
     future: <A::Future as IntoFuture>::Future,
-    ret: Option<oneshot::Sender<Result<U, A::Error>>>,
+    ret: Option<oneshot::Sender<Result<A::Response, A::Error>>>,
 }
 
 // Stores in-flight responses
@@ -224,7 +210,7 @@ pub fn actor_fn<F, T, U>(f: F) -> ActorFn<F, T>
 
 scoped_thread_local!(static CURRENT_ACTOR_REF: *const ::std::any::Any);
 
-impl<A: Actor, U: 'static> ActorAndOutbox<A, U> {
+impl<A: Actor> ActorAndOutbox<A> {
     fn with<F, R>(&mut self, func: F) -> R
         where F: FnOnce(&mut A) -> R,
     {
@@ -266,21 +252,9 @@ impl Builder {
     pub fn spawn<A, S>(self, s: &S, actor: A)
         -> ActorRef<A::Request, A::Response, A::Error>
         where A: Actor,
-              S: Spawn<ActorCell<A, A::Response>>,
+              S: Spawn<ActorCell<A>>,
     {
-        let (tx, rx) = self.pair(actor, TailCall::Complete);
-        s.spawn_detached(rx);
-        tx
-    }
-
-    /// Spawn a new tail-recursive-capable actor
-    pub fn spawn_tail_recursive<A, S, U>(self, s: &S, actor: A)
-        -> ActorRef<A::Request, U, A::Error>
-        where A: Actor<Response = TailCall<<A as Actor>::Request, U>>,
-              S: Spawn<ActorCell<A, U>>,
-    {
-        fn _identity<T>(x: T) -> T { x }
-        let (tx, rx) = self.pair(actor, _identity);
+        let (tx, rx) = self.pair(actor);
         s.spawn_detached(rx);
         tx
     }
@@ -288,22 +262,23 @@ impl Builder {
     /// Spawn the given closure as an actor
     pub fn spawn_fn<F, T: 'static, U: 'static, S>(self, s: &S, f: F)
         -> ActorRef<T, U::Item, U::Error>
-        where F: FnMut(T) -> U,
+        where F: Fn(T) -> U,
               U: IntoFuture,
-              S: Spawn<ActorCell<ActorFn<F, T>, U::Item>>,
+              S: Spawn<ActorCell<ActorFn<F, T>>>,
     {
         self.spawn(s, actor_fn(f))
     }
 
-    fn pair<A, U>(self, actor: A, trampoline: fn(A::Response) -> TailCall<A::Request, U>)
-        -> (ActorRef<A::Request, U, A::Error>, ActorCell<A, U>)
+    fn pair<A>(self, actor: A) -> (ActorRefOf<A>, ActorCell<A>)
         where A: Actor,
+              A::Request: 'static,
+              A::Error: 'static,
     {
         // TODO: respect inbox bound
         let (tx, rx) = mpsc::channel(self.inbox);
 
-        let rx = ActorCell::new(actor, tx.clone(), rx, self.in_flight, trampoline);
-        let tx = ActorRef::Outbox(Outbox(tx));
+        let rx = ActorCell::new(actor, tx.clone(), rx, self.in_flight);
+        let tx = ActorRef(Outbox(tx));
 
         (tx, rx)
     }
@@ -349,26 +324,45 @@ impl<T, U, E> ActorRef<T, U, E>
 {
     /// Returns `Async::Ready` when the actor can accept a new request
     pub fn poll_ready(&mut self) -> Async<()> {
-        match self {
-            &mut ActorRef::Null(..) => Async::Ready(()),
-            &mut ActorRef::Outbox(Outbox(ref mut tx)) => tx.poll_ready(),
+        (self.0).0.poll_ready()
+    }
+}
+
+impl<T: 'static, U: 'static, E: 'static> ActorRef<T, U, E>
+    where E: From<CallError<T>>,
+{
+    /// A handle to the currently-running actor
+    pub fn current() -> Option<Self> {
+        if CURRENT_ACTOR_REF.is_set() {
+            CURRENT_ACTOR_REF.with(|any| {
+                unsafe { &**any }.downcast_ref::<mpsc::Sender<Envelope<T, U, E>>>().cloned()
+                    .map(|tx| ActorRef(Outbox(tx)))
+            })
+        } else {
+            None
         }
     }
+}
+
+impl<T, U, E> Clone for ActorRef<T, U, E> {
+    fn clone(&self) -> Self {
+        ActorRef(self.0.clone())
+    }
+}
+
+impl<T, U, E> Service for ActorRef<T, U, E>
+    where E: From<CallError<T>>,
+{
+    type Request = T;
+    type Response = U;
+    type Error = E;
+    type Future = ActorFuture<T, U, E>;
 
     /// Send a request to the actor
-    pub fn call(&mut self, request: T) -> ActorFuture<T, U, E> {
+    fn call(&self, request: T) -> ActorFuture<T, U, E> {
         let (tx, rx) = oneshot::channel();
 
-        let outbox = match self {
-            &mut ActorRef::Null(f) => {
-                let _ = tx.send(Ok(f()));
-                return ActorFuture {
-                    state: CallState::Waiting(rx),
-                };
-            },
-            &mut ActorRef::Outbox(Outbox(ref mut tx)) => tx,
-        };
-
+        let mut outbox = (self.0).0.clone();
         let envelope = Envelope {
             arg: request,
             ret: tx,
@@ -390,39 +384,6 @@ impl<T, U, E> ActorRef<T, U, E>
         };
 
         ActorFuture { state: state }
-    }
-}
-
-impl<T: 'static, U: 'static, E: 'static> ActorRef<T, U, E>
-    where E: From<CallError<T>>,
-{
-    /// A handle to the currently-running actor
-    pub fn current() -> Option<Self> {
-        if CURRENT_ACTOR_REF.is_set() {
-            CURRENT_ACTOR_REF.with(|any| {
-                unsafe { &**any }.downcast_ref::<mpsc::Sender<Envelope<T, U, E>>>().cloned()
-                    .map(|tx| ActorRef::Outbox(Outbox(tx)))
-            })
-        } else {
-            None
-        }
-    }
-}
-
-impl<T, E> ActorRef<T, (), E> {
-    /// A handle which drops all calls and returns `()`
-    pub fn null() -> Self {
-        fn _null() {}
-        ActorRef::Null(_null)
-    }
-}
-
-impl<T, U, E> Clone for ActorRef<T, U, E> {
-    fn clone(&self) -> Self {
-        match self {
-            &ActorRef::Null(f) => ActorRef::Null(f),
-            &ActorRef::Outbox(ref o) => ActorRef::Outbox(o.clone()),
-        }
     }
 }
 
@@ -465,13 +426,12 @@ impl<T, U, E> Future for ActorFuture<T, U, E>
  *
  */
 
-impl<A: Actor, U> ActorCell<A, U> {
+impl<A: Actor> ActorCell<A> {
     fn new(actor: A,
-           tx: mpsc::Sender<Envelope<A::Request, U, A::Error>>,
-           rx: mpsc::Receiver<Envelope<A::Request, U, A::Error>>,
-           max_in_flight: usize,
-           trampoline: fn(A::Response) -> TailCall<A::Request, U>)
-        -> ActorCell<A, U>
+           tx: mpsc::Sender<Envelope<A::Request, A::Response, A::Error>>,
+           rx: mpsc::Receiver<Envelope<A::Request, A::Response, A::Error>>,
+           max_in_flight: usize)
+        -> ActorCell<A>
     {
         ActorCell {
             actor: ActorAndOutbox {
@@ -484,7 +444,6 @@ impl<A: Actor, U> ActorCell<A, U> {
             next_future: 0,
             active: 0,
             max: max_in_flight,
-            trampoline: trampoline,
         }
     }
 
@@ -496,8 +455,7 @@ impl<A: Actor, U> ActorCell<A, U> {
             // Poll the future
             match self.futures[i] {
                 Slot::Data(ref mut f) => {
-                    let actor = &mut self.actor;
-                    match f.poll(&mut self.trampoline, &mut |r| actor.with(|a| a.call(r))) {
+                    match f.poll() {
                         Async::NotReady => {
                             ret = Async::NotReady;
                             continue;
@@ -541,11 +499,7 @@ impl<A: Actor, U> ActorCell<A, U> {
                         ret: Some(ret),
                     };
 
-                    let processing_poll = {
-                        let actor = &mut self.actor;
-                        processing.poll(&mut self.trampoline, &mut |r| actor.with(|a| a.call(r)))
-                    };
-                    if processing_poll.is_ready() {
+                    if processing.poll().is_ready() {
                         // request done, move on to the next one
                         continue;
                     }
@@ -578,7 +532,7 @@ impl<A: Actor, U> ActorCell<A, U> {
         }
     }
 
-    fn push_processing(&mut self, processing: Processing<A, U>) {
+    fn push_processing(&mut self, processing: Processing<A>) {
         debug_assert!(self.active < self.max);
 
         // If the `futures` slab is at capacity, grow by 1
@@ -604,7 +558,7 @@ impl<A: Actor, U> ActorCell<A, U> {
     }
 }
 
-impl<A: Actor, U> Future for ActorCell<A, U> {
+impl<A: Actor> Future for ActorCell<A> {
     type Item = ();
     type Error = ();
 
@@ -631,9 +585,8 @@ impl<A: Actor, U> Future for ActorCell<A, U> {
  *
  */
 
-impl<A: Actor, U: 'static> Processing<A, U> {
-    fn poll(&mut self, mut trampoline: &mut FnMut(A::Response) -> TailCall<A::Request, U>, mut call_actor: &mut FnMut(A::Request) -> A::Future) -> Async<()>
-    {
+impl<A: Actor> Processing<A> {
+    fn poll(&mut self) -> Async<()> {
         {
             // First, check to see if there is still interest on the receiving
             // the value
@@ -645,15 +598,7 @@ impl<A: Actor, U: 'static> Processing<A, U> {
         }
 
         let ret = match self.future.poll() {
-            Ok(Async::Ready(v)) => {
-                match trampoline(v) {
-                    TailCall::Complete(v) => Ok(v),
-                    TailCall::Call(c) => {
-                        self.future = call_actor(c).into_future();
-                        return self.poll(trampoline, call_actor);
-                    },
-                }
-            },
+            Ok(Async::Ready(v)) => Ok(v),
             Ok(Async::NotReady) => return Async::NotReady,
             Err(e) => Err(e),
         };
@@ -707,4 +652,23 @@ impl<T> From<CallError<T>> for ::std::io::Error {
             CallError::Aborted => io::Error::new(io::ErrorKind::Other, "actor aborted request"),
         }
     }
+}
+
+/// A service which drops all requests and returns `()`
+pub struct NullService<T, E>(PhantomData<fn(T) -> E>);
+
+impl<T, E> Service for NullService<T, E> {
+    type Request = T;
+    type Response = ();
+    type Error = E;
+    type Future = future::Ok<(), E>;
+
+    fn call(&self, _: Self::Request) -> Self::Future {
+        future::ok(())
+    }
+}
+
+/// Returns a service which drops all requests and returns `()`
+pub fn null<T, E>() -> NullService<T, E> {
+    NullService(PhantomData)
 }
