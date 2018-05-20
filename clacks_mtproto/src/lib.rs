@@ -9,6 +9,12 @@ extern crate extfmt;
 extern crate rand;
 extern crate serde;
 
+macro_rules! _invalid_id {
+    ($id:ident) => {
+        Err(::error::ErrorKind::InvalidType(Self::possible_constructors(), $id).into())
+    };
+}
+
 pub mod error;
 pub mod mtproto;
 mod mtproto_prelude;

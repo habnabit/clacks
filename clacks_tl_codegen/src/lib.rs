@@ -1346,7 +1346,6 @@ impl Constructor<TypeIR, FieldIR> {
         }).unwrap_or_else(|| quote!());
 
         quote! {
-
             impl #serialize_generics ::BareSerialize for #name #generics {
                 fn serialize_bare(&self, _ser: &mut ::Serializer) -> ::Result<()> {
                     #serialize
@@ -1507,6 +1506,45 @@ impl Constructors<TypeIR, FieldIR> {
         }
     }
 
+    fn as_option_type_impl(&self) -> quote::Tokens {
+        if self.0.len() != 2 {
+            return quote!();
+        }
+        let tl_ids = self.constructors_and_tl_ids().collect::<Vec<_>>();
+        let empty = tl_ids.iter().find(|&&(_, c)| c.fields.is_empty());
+        let nonempty = tl_ids.iter().find(|&&(_, c)| !c.fields.is_empty());
+        let (empty_id, nonempty_id, nonempty_cons) = match (empty, nonempty) {
+            (Some(&(ref i_e, _)), Some(&(ref i_n, c_n))) => (i_e, i_n, c_n),
+            _ => return quote!(),
+        };
+        let nonempty_variant = nonempty_cons.variant.unboxed();
+        let nonempty_deserialize = nonempty_cons.as_variant_deserialize();
+
+        quote! {
+
+            impl ::BoxedSerialize for Option<#nonempty_variant> {
+                fn serialize_boxed<'this>(&'this self) -> (::ConstructorNumber, &'this ::BareSerialize) {
+                    match *self {
+                        None => (#empty_id, &()),
+                        Some(ref x) => (#nonempty_id, x),
+                    }
+                }
+            }
+
+            impl ::BoxedDeserialize for Option<#nonempty_variant> {
+                fn possible_constructors() -> Vec<::ConstructorNumber> { vec![#empty_id, #nonempty_id] }
+                fn deserialize_boxed(_id: ::ConstructorNumber, _de: &mut ::Deserializer) -> ::Result<Self> {
+                    match _id {
+                        #empty_id => Ok(None),
+                        #nonempty_id => Ok(Some #nonempty_deserialize),
+                        id => _invalid_id!(id),
+                    }
+                }
+            }
+
+        }
+    }
+
     fn constructors_and_tl_ids<'this>(&'this self) -> Box<'this + Iterator<Item = (quote::Tokens, &'this Constructor<TypeIR, FieldIR>)>> {
         Box::new(self.0.iter().filter_map(|cm| {
             cm.0.tl_id().map(|id| (id, &cm.0))
@@ -1554,7 +1592,7 @@ impl Constructors<TypeIR, FieldIR> {
         quote! {
             match _id {
                 #( #constructors, )*
-                id => Err(::error::ErrorKind::InvalidType(Self::possible_constructors(), id).into()),
+                id => _invalid_id!(id),
             }
         }
     }
@@ -1585,6 +1623,7 @@ impl Constructors<TypeIR, FieldIR> {
             &name,
             self.as_serialize_match(&name),
             self.as_deserialize_match(&name));
+        let option_type_impl = self.as_option_type_impl();
 
         quote! {
             #[derive(Debug, Clone, Serialize)]
@@ -1594,6 +1633,7 @@ impl Constructors<TypeIR, FieldIR> {
             }
             #methods
             #type_impl
+            #option_type_impl
         }
     }
 }

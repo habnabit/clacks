@@ -142,7 +142,7 @@ impl BoxedDeserialize for TLObject {
     fn deserialize_boxed(id: ConstructorNumber, de: &mut Deserializer) -> Result<Self> {
         match ::mtproto::DYNAMIC_DESERIALIZERS.get(&id) {
             Some(f) => f(id, de),
-            None => Err(::error::ErrorKind::InvalidType(Self::possible_constructors(), id).into()),
+            None => _invalid_id!(id),
         }
     }
 }
