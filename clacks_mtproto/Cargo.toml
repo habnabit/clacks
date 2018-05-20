@@ -1,6 +1,6 @@
 [package]
 name = "clacks_mtproto"
-version = "0.0.4"
+version = "0.0.5"
 authors = ["Aaron Gallagher <_@habnab.it>", "Connie Hilarides <connorcpu@live.com>"]
 license = "MIT/Apache-2.0"
 description = "minimal wrappers for telegram's mtproto serialization"
@@ -17,4 +17,4 @@ serde_derive = "1.0"
 
 [build-dependencies.clacks_tl_codegen]
 path = "../clacks_tl_codegen"
-version = "0.0.4"
+version = "0.0.5"

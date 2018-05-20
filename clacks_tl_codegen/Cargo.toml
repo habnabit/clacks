@@ -1,6 +1,6 @@
 [package]
 name = "clacks_tl_codegen"
-version = "0.0.4"
+version = "0.0.5"
 authors = ["Aaron Gallagher <_@habnab.it>", "Connie Hilarides <connorcpu@live.com>"]
 license = "MIT/Apache-2.0"
 description = "codegen for clacks"

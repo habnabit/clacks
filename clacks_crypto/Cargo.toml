@@ -1,6 +1,6 @@
 [package]
 name = "clacks_crypto"
-version = "0.0.4"
+version = "0.0.5"
 authors = ["Aaron Gallagher <_@habnab.it>", "Connie Hilarides <connorcpu@live.com>"]
 license = "MIT/Apache-2.0"
 description = "crypto-related functionality for telegram/mtproto"
@@ -13,4 +13,4 @@ rand = "0.4"
 
 [dependencies.clacks_mtproto]
 path = "../clacks_mtproto"
-version = "0.0.4"
+version = "0.0.5"
