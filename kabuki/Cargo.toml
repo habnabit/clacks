@@ -1,11 +1,12 @@
 [package]
 name = "kabuki"
-version = "0.0.1"
+version = "0.0.2"
 authors = ["Carl Lerche <me@carllerche.com>"]
 description = "Name reservation"
 license = "MIT"
 
 [dependencies]
+debug_stub_derive = "*"
 futures = "0.1"
 futures-threadpool = "0.1"
 futures-mpsc = "0.1"

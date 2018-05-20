@@ -1,0 +1,16 @@
+[package]
+name = "kabuki_extras"
+version = "0.1.0"
+authors = ["Aaron Gallagher <_@habnab.it>"]
+
+[dependencies]
+debug_stub_derive = "*"
+futures = "0.1"
+slog = "*"
+smallvec = "*"
+tokio-service = "*"
+void = "*"
+
+[dependencies.kabuki]
+path = "../kabuki"
+version = "0.0.2"
