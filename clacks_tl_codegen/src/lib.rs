@@ -88,7 +88,7 @@ pub mod parser {
         pub ty: Type,
     }
 
-    #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+    #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
     pub struct Constructor<Ty, Fi> {
         pub variant: Ty,
         pub tl_id: Option<u32>,
@@ -320,7 +320,7 @@ pub mod parser {
 
 use parser::{Constructor, Delimiter, Field, Item, Matched, NameChunks, Type};
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::mem;
 
 fn fail_hard() -> quote::Tokens {
@@ -550,11 +550,13 @@ fn lift_option_value(value: &Option<quote::Tokens>) -> quote::Tokens {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Hash)]
 struct TypeName {
     tokens: quote::Tokens,
     idents: Option<Vec<syn::Ident>>,
 }
+
+impl Eq for TypeName {}
 
 impl TypeName {
     fn transformed_tokens<F>(&self, func: F) -> quote::Tokens
@@ -588,7 +590,7 @@ impl<S> ::std::iter::FromIterator<S> for TypeName
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum WireKind {
     Bare(TypeName),
     Boxed(TypeName),
@@ -696,7 +698,7 @@ impl WireKind {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct TypeIR {
     wire_kind: WireKind,
     needs_box: bool,
@@ -769,7 +771,9 @@ impl TypeIR {
     }
 
     fn with_option_wrapper(mut self) -> Self {
-        self.with_option = true;
+        if !self.wire_kind.is_unit() {
+            self.with_option = true;
+        }
         self
     }
 
@@ -820,10 +824,10 @@ impl TypeIR {
     }
 
     fn field_type(&self) -> quote::Tokens {
-        use self::WireKind::*;
-        match self.wire_kind {
-            FlaggedTrue if self.with_option => quote!(bool),
-            _ => self.boxed(),
+        if self.is_unit() {
+            quote!(bool)
+        } else {
+            self.boxed()
         }
     }
 
@@ -839,12 +843,32 @@ impl TypeIR {
         if self.is_unit() {quote!(&)} else {quote!()}
     }
 
+    fn field_reference_type(&self) -> quote::Tokens {
+        let ref_ = self.reference_prefix();
+        let ty = if self.is_unit() {
+            quote!(bool)
+        } else {
+            self.non_field_type()
+        };
+        wrap_option_type(self.with_option, quote!(#ref_ #ty))
+    }
+
+    fn as_field_reference(&self, on: quote::Tokens) -> quote::Tokens {
+        if self.is_unit() {
+            wrap_option_value(self.with_option, quote!(#on))
+        } else if self.with_option {
+            quote!(#on.as_ref())
+        } else {
+            quote!(&#on)
+        }
+    }
+
     fn is_defined_trailer(&self) -> quote::Tokens {
         use self::WireKind::*;
         match self.wire_kind {
-            _ if !self.with_option => quote!(FAIL_LOUDLY_AT_COMPILE_TIME),
+            _ if self.with_option => quote!(.is_some()),
             FlaggedTrue => quote!(),
-            _ => quote!(.is_some()),
+            _ => fail_hard(),
         }
     }
 
@@ -876,7 +900,7 @@ impl TypeIR {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct FieldIR {
     name: String,
     ty: TypeIR,
@@ -1444,81 +1468,68 @@ impl Constructors<Type, Field> {
 }
 
 impl Constructors<TypeIR, FieldIR> {
-    // fn coalesce_methods(&self) -> BTreeMap<&str, BTreeMap<&Type, BTreeSet<&Constructor<TypeIR>>>> {
-    //     let mut map: BTreeMap<&str, BTreeMap<&Type, BTreeSet<&Constructor<TypeIR>>>> = BTreeMap::new();
-    //     for cons in &self.0 {
-    //         for field in cons.non_flag_fields() {
-    //             let name = match field.name.as_ref() {
-    //                 Some(s) => s.as_str(),
-    //                 None => continue,
-    //             };
-    //             map.entry(name)
-    //                 .or_insert_with(Default::default)
-    //                 .entry(&field.ty)
-    //                 .or_insert_with(Default::default)
-    //                 .insert(cons);
-    //         }
-    //     }
-    //     map
-    // }
+    fn coalesce_methods(&self) -> BTreeMap<&str, HashMap<&TypeIR, HashSet<&Constructor<TypeIR, FieldIR>>>> {
+        let mut map: BTreeMap<&str, HashMap<&TypeIR, HashSet<&Constructor<TypeIR, FieldIR>>>> = BTreeMap::new();
+        for &Matched(ref cons, _) in &self.0 {
+            for field in &cons.fields {
+                if field.ty.is_flags() {
+                    continue
+                }
+                map.entry(&field.name)
+                    .or_insert_with(Default::default)
+                    .entry(&field.ty)
+                    .or_insert_with(Default::default)
+                    .insert(cons);
+            }
+        }
+        map
+    }
 
     fn determine_methods(&self, enum_name: &syn::Ident) -> quote::Tokens {
-        quote!()
+        let all_constructors = self.0.len();
+        let mut methods = vec![];
+        for (name, typemap) in self.coalesce_methods() {
+            if typemap.len() != 1 {
+                continue;
+            }
+            let name = no_conflict_ident(name);
+            let (ty_ir, constructors) = typemap.into_iter().next().unwrap();
+            let mut return_ir = ty_ir.clone();
+            let exhaustive = constructors.len() == all_constructors;
+            if !exhaustive {
+                return_ir.with_option = true;
+            }
+            let value = wrap_option_value(!exhaustive && !ty_ir.with_option, ty_ir.as_field_reference(quote!(x.#name)));
+            let constructors = constructors.into_iter()
+                .map(|c| {
+                    let cons_name = c.variant_name();
+                    quote!(&#enum_name::#cons_name(ref x) => #value)
+                });
+            let trailer = if exhaustive {
+                quote!()
+            } else {
+                quote!(_ => None)
+            };
+            let ty = return_ir.field_reference_type();
+            methods.push(quote! {
+                pub fn #name(&self) -> #ty {
+                    match self {
+                        #( #constructors, )*
+                        #trailer
+                    }
+                }
+            });
+        }
 
-        // let all_constructors = self.0.len();
-        // let mut methods = vec![];
-        // for (name, typemap) in self.coalesce_methods() {
-        //     if typemap.len() != 1 {
-        //         continue;
-        //     }
-        //     let (output_ty, constructors) = typemap.into_iter().next().unwrap();
-        //     if constructors.len() <= 1 {
-        //         continue;
-        //     }
-        //     let name = no_conflict_ident(name);
-        //     let mut ty_ir = output_ty.as_type();
-        //     let field_is_option = ty_ir.needs_option();
-        //     let exhaustive = constructors.len() == all_constructors;
-        //     if !exhaustive {
-        //         ty_ir.with_option = true;
-        //     }
-        //     let force_option = !exhaustive && ty_ir.is_unit();
-        //     let value = if field_is_option && !ty_ir.is_copy {
-        //         quote!(x.#name.as_ref())
-        //     } else {
-        //         let ref_ = ty_ir.reference_prefix();
-        //         wrap_option_value((ty_ir.needs_option() && !field_is_option) || force_option, quote!(#ref_ x.#name))
-        //     };
-        //     let constructors = constructors.into_iter()
-        //         .map(|c| {
-        //             let cons_name = c.variant_name();
-        //             quote!(&#enum_name::#cons_name(ref x) => #value)
-        //         });
-        //     let trailer = if exhaustive {
-        //         quote!()
-        //     } else {
-        //         quote!(_ => None)
-        //     };
-        //     let ty = wrap_option_type(force_option, ty_ir.ref_type());
-        //     methods.push(quote! {
-        //         pub fn #name(&self) -> #ty {
-        //             match self {
-        //                 #( #constructors, )*
-        //                 #trailer
-        //             }
-        //         }
-        //     });
-        // }
-
-        // if methods.is_empty() {
-        //     quote!()
-        // } else {
-        //     quote! {
-        //         impl #enum_name {
-        //             #( #methods )*
-        //         }
-        //     }
-        // }
+        if methods.is_empty() {
+            quote!()
+        } else {
+            quote! {
+                impl #enum_name {
+                    #( #methods )*
+                }
+            }
+        }
     }
 
     fn as_type_impl(&self, name: &syn::Ident, type_id: quote::Tokens, serialize: quote::Tokens, deserialize: quote::Tokens) -> quote::Tokens {
