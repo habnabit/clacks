@@ -543,13 +543,6 @@ fn wrap_option_value(wrap: bool, ty: quote::Tokens) -> quote::Tokens {
     }
 }
 
-fn lift_option_value(value: &Option<quote::Tokens>) -> quote::Tokens {
-    match value {
-        &Some(ref t) => quote!(Some(#t)),
-        &None => quote!(None),
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Hash)]
 struct TypeName {
     tokens: quote::Tokens,
@@ -1041,15 +1034,6 @@ impl Constructor<TypeIR, FieldIR> {
         }
     }
 
-    fn as_variant_empty_pattern(&self) -> quote::Tokens {
-        let name = self.variant_name();
-        if self.fields.is_empty() {
-            quote!(#name)
-        } else {
-            quote!(#name(..))
-        }
-    }
-
     fn generics(&self) -> quote::Tokens {
         if self.type_parameters.is_empty() {
             return quote!();
@@ -1339,17 +1323,6 @@ impl Constructor<TypeIR, FieldIR> {
         }
     }
 
-    fn as_variant_generic_type(&self) -> TypeIR {
-        let variant = self.variant.clone();
-        match self.type_parameters.first() {
-            Some(param) => {
-                assert!(self.type_parameters.len() == 1);
-                TypeIR::type_parameter(param.name()).with_container(variant)
-            },
-            None => variant,
-        }
-    }
-
     fn tl_id(&self) -> Option<quote::Tokens> {
         self.tl_id.as_ref().map(|tl_id| {
             let tl_id: syn::LitInt = syn::parse_str(&format!("0x{:08x}", tl_id)).unwrap();
@@ -1359,7 +1332,6 @@ impl Constructor<TypeIR, FieldIR> {
 
     fn as_type_impl(&self, name: &syn::Ident, serialize: quote::Tokens, deserialize: Option<quote::Tokens>) -> quote::Tokens {
         let serialize_generics = self.serialize_generics();
-        let ty = self.as_variant_generic_type();
         let generics = self.generics();
 
         let deserialize = deserialize.map(|body| {
@@ -1384,24 +1356,6 @@ impl Constructor<TypeIR, FieldIR> {
             #deserialize
         }
     }
-}
-
-fn common_prefix_of<'a>(a: Option<&'a str>, b: &'a str) -> &'a str {
-    let a = match a {
-        None => return b,
-        Some(s) => s,
-    };
-    let ret = a.char_indices()
-        .zip(b.char_indices())
-        .skip_while(|&((_, c_a), (_, c_b))| c_a == c_b)
-        .next()
-        .map(|((e_a, _), (e_b, _))| {
-            assert_eq!(e_a, e_b);
-            &b[..e_a]
-        })
-        .unwrap_or(b);
-    let min_len = a.len().min(b.len()).min(ret.len());
-    &ret[..min_len]
 }
 
 fn camelize<F>(resolve_map: &mut TypeResolutionMap, ty: &mut Type, additional_correction: F) -> NameChunks
@@ -1532,7 +1486,7 @@ impl Constructors<TypeIR, FieldIR> {
         }
     }
 
-    fn as_type_impl(&self, name: &syn::Ident, type_id: quote::Tokens, serialize: quote::Tokens, deserialize: quote::Tokens) -> quote::Tokens {
+    fn as_type_impl(&self, name: &syn::Ident, serialize: quote::Tokens, deserialize: quote::Tokens) -> quote::Tokens {
         let tl_ids = self.as_tl_ids();
 
         quote! {
@@ -1557,19 +1511,6 @@ impl Constructors<TypeIR, FieldIR> {
         Box::new(self.0.iter().filter_map(|cm| {
             cm.0.tl_id().map(|id| (id, &cm.0))
         }))
-    }
-
-    fn as_type_id_match(&self, enum_name: &syn::Ident) -> quote::Tokens {
-        let constructors = self.constructors_and_tl_ids()
-            .map(|(tl_id, c)| {
-                let pat = c.as_variant_empty_pattern();
-                quote!(&#enum_name::#pat => #tl_id)
-            });
-        quote! {
-            match self {
-                #( #constructors, )*
-            }
-        }
     }
 
     fn as_serialize_match(&self, enum_name: &syn::Ident) -> quote::Tokens {
@@ -1642,7 +1583,6 @@ impl Constructors<TypeIR, FieldIR> {
         let methods = self.determine_methods(&name);
         let type_impl = self.as_type_impl(
             &name,
-            self.as_type_id_match(&name),
             self.as_serialize_match(&name),
             self.as_deserialize_match(&name));
 
