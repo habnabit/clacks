@@ -1,12 +1,11 @@
-use futures::{Async, Canceled, Future, IntoFuture, Poll, Sink, StartSend, Stream, future, stream};
+use futures::{Async, AsyncSink, Canceled, Future, IntoFuture, Poll, Sink, StartSend, Stream, stream};
 use futures::unsync::{mpsc, oneshot};
 use kabuki::{self, Actor, ActorRef};
 use slog::Logger;
 use smallvec::{Array, SmallVec};
 use std::{fmt, mem};
+use std::collections::VecDeque;
 use std::rc::Rc;
-use std::marker::PhantomData;
-use tokio_service::Service;
 use void::Void;
 
 
@@ -29,9 +28,11 @@ pub type ScrundleActorExternal<Ac> = ActorRef<
     <Ac as ScrundleCapable>::Iter, (), <Ac as Actor>::Error>;
 
 type ActorSLS<Ac> = ScrundleStream<<Ac as Actor>::Request, <Ac as Actor>::Error>;
-type NextScrundleStream<Req, E> = Box<Stream<Item = Scrundle<Req, E>, Error = ()>>;
+type NextScrundleStream<Req, E> = Box<Stream<Item = Scrundle<Req, E>, Error = E>>;
 type NextScrundle<Req, E> = (Option<Scrundle<Req, E>>, NextScrundleStream<Req, E>);
-type NextScrundleFuture<Req, E> = Box<Future<Item = NextScrundle<Req, E>, Error = ()>>;
+type NextScrundleFuture<Req, E> = Box<Future<Item = NextScrundle<Req, E>, Error = E>>;
+type NextScrundleMaybeStream<Req, E> = (Option<Scrundle<Req, E>>, Option<NextScrundleStream<Req, E>>);
+type NextScrundleMaybeStreamFuture<Req, E> = Box<Future<Item = NextScrundleMaybeStream<Req, E>, Error = E>>;
 
 pub trait ScrundleCapable: Actor<Response = ActorSL<Self>>
     where Self: Sized,
@@ -93,7 +94,9 @@ impl<Req, E> ScrundleRemotes<Req, E>
 {
     fn new() -> Self {
         let (tx, rx) = mpsc::channel(5);
-        ScrundleRemotes { tx: tx, rxv: vec![Box::new(rx)] }
+        ScrundleRemotes { tx: tx, rxv: vec![Box::new({
+            rx.map_err(|()| unreachable!())
+        })] }
     }
 
     fn map_err_into<E2>(self) -> ScrundleRemotes<Req, E2>
@@ -105,7 +108,8 @@ impl<Req, E> ScrundleRemotes<Req, E>
             self.rxv.into_iter()
                 .map(|stream| Box::new({
                     stream.map(Scrundle::map_err_into)
-                }) as Box<Stream<Item = Scrundle<Req, E2>, Error = ()>>)
+                        .map_err(Into::into)
+                }) as Box<Stream<Item = Scrundle<Req, E2>, Error = E2>>)
         });
         ret
     }
@@ -127,11 +131,11 @@ impl<Req, E> ScrundleRemotes<Req, E>
     }
 
     fn into_scrundle_stream(self) -> ScrundleStream<Req, E> {
-        let mut stream = stream::FuturesUnordered::new();
+        let mut streams = stream::FuturesUnordered::new();
         for rx in self.rxv {
-            stream.push(stream_into_step_future(rx));
+            streams.push(stream_into_step_future(rx));
         }
-        ScrundleStream { streams: vec![stream] }
+        ScrundleStream { streams }
     }
 }
 
@@ -148,7 +152,8 @@ impl<E> ScrundleRemotes<Void, E>
             self.rxv.into_iter()
                 .map(|stream| Box::new({
                     stream.map(Scrundle::never_into)
-                }) as Box<Stream<Item = Scrundle<Req, E2>, Error = ()>>)
+                        .map_err(Into::into)
+                }) as Box<Stream<Item = Scrundle<Req, E2>, Error = E2>>)
         });
         ret
     }
@@ -160,21 +165,12 @@ fn stream_into_step_future<Req, E>(stream: NextScrundleStream<Req, E>) -> NextSc
 {
     Box::new({
         stream.into_future()
-            .map_err(|((), _)| ())
+            .map_err(|(e, _)| e)
     })
 }
 
 struct ScrundleStream<Req, E> {
-    streams: Vec<stream::FuturesUnordered<NextScrundleFuture<Req, E>>>,
-}
-
-impl<Req, E> ScrundleStream<Req, E>
-    where Req: 'static,
-          E: 'static,
-{
-    fn merge(&mut self, other: Self) {
-        self.streams.extend(other.streams);
-    }
+    streams: stream::FuturesUnordered<NextScrundleFuture<Req, E>>,
 }
 
 impl<Req, E> Stream for ScrundleStream<Req, E>
@@ -182,25 +178,19 @@ impl<Req, E> Stream for ScrundleStream<Req, E>
           E: 'static,
 {
     type Item = Scrundle<Req, E>;
-    type Error = ();
+    type Error = E;
 
     fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
-        for stream in &mut self.streams {
-            match stream.poll()? {
+        loop {
+            match self.streams.poll()? {
                 Async::Ready(Some((Some(ret), this_stream))) => {
-                    stream.push(stream_into_step_future(this_stream));
+                    self.streams.push(stream_into_step_future(this_stream));
                     return Ok(Async::Ready(Some(ret)));
                 },
-                Async::Ready(Some((None, _))) |
-                Async::Ready(None) |
-                Async::NotReady => (),
+                Async::Ready(Some((None, _))) => continue,
+                Async::Ready(None) => return Ok(Async::Ready(None)),
+                Async::NotReady => return Ok(Async::NotReady),
             }
-        }
-        self.streams.retain(|s| !s.is_empty());
-        if self.streams.is_empty() {
-            Ok(Async::Ready(None))
-        } else {
-            Ok(Async::NotReady)
         }
     }
 }
@@ -648,9 +638,9 @@ impl<Req, E> Sink for RemoteScrundle<Req, E>
 pub struct ScrundleDrainingFuture<Ac>
     where Ac: 'static + ScrundleCapable
 {
-    further_calls_tx: mpsc::UnboundedSender<FurtherCall<Ac>>,
-    active: stream::FuturesUnordered<Box<Future<Item = ActorSL<Ac>, Error = Ac::Error>>>,
-    remote_rx: Option<ActorSLS<Ac>>,
+    further_calls_tx: mpsc::Sender<FurtherCall<Ac>>,
+    further_calls: VecDeque<Ac::Request>,
+    active: stream::FuturesUnordered<NextScrundleMaybeStreamFuture<Ac::Request, Ac::Error>>,
 }
 
 impl<Ac> ScrundleDrainingFuture<Ac>
@@ -658,27 +648,22 @@ impl<Ac> ScrundleDrainingFuture<Ac>
           Ac::Request: fmt::Debug,
           Ac::Error: From<Canceled>,
 {
-    fn new(further_calls_tx: mpsc::UnboundedSender<FurtherCall<Ac>>, calls: Ac::Iter) -> Self {
-        let mut this = Self {
+    fn new(further_calls_tx: mpsc::Sender<FurtherCall<Ac>>, calls: Ac::Iter) -> Self {
+        Self {
             further_calls_tx,
-            remote_rx: None,
+            further_calls: calls.into_iter().collect(),
             active: stream::FuturesUnordered::new(),
-        };
-        this.merge_calls(calls);
-        this
+        }
     }
 
-    fn merge_scrundle(&mut self, sl: ActorSL<Ac>) {
-        self.merge_calls(sl.calls);
+    fn merge_scrundle(&mut self, mut sl: ActorSL<Ac>) {
+        self.further_calls.extend(sl.calls);
         self.merge_futures(sl.futures);
-        match (&mut self.remote_rx, sl.remote) {
-            (r @ &mut None, Some(remote)) => {
-                *r = Some(remote.into_scrundle_stream());
-            },
-            (&mut Some(ref mut stream), ref mut remote_opt @ Some(_)) => {
-                stream.merge(remote_opt.take().unwrap().into_scrundle_stream());
-            },
-            (_, None) => (),
+        if let Some(remote) = sl.remote.take() {
+            self.active.push(Box::new({
+                stream_into_step_future(Box::new(remote.into_scrundle_stream()))
+                    .map(|(sc, st)| (sc, Some(st)))
+            }))
         }
     }
 
@@ -687,49 +672,48 @@ impl<Ac> ScrundleDrainingFuture<Ac>
               IF: IntoFuture<Item = ActorSL<Ac>, Error = Ac::Error> + 'static,
     {
         for fut in futures {
-            self.active.push(Box::new(fut.into_future()))
+            self.active.push(Box::new({
+                fut.into_future()
+                    .map(|s| (Some(s), None))
+            }))
         }
     }
 
-    fn merge_calls<I>(&mut self, calls: I)
-        where I: IntoIterator<Item = Ac::Request>,
-    {
-        for req in calls {
+    fn do_calls_send(&mut self) -> Poll<(), mpsc::SendError<FurtherCall<Ac>>> {
+        while let Some(req) = self.further_calls.pop_front() {
             let (tx, rx) = oneshot::channel();
-            if let Err(e) = self.further_calls_tx.unbounded_send((req, tx)) {
-                // ::slog_scope::with_logger(|log| {
-                //     warn!(log, "XXX send failed"; "error" => ?e);
-                // });
+            match self.further_calls_tx.start_send((req, tx))? {
+                AsyncSink::Ready => {
+                    self.active.push(Box::new({
+                        rx.map_err(Into::into)
+                            .and_then(|f| f)
+                            .map(|sc| (Some(sc), None))
+                    }));
+                }
+                AsyncSink::NotReady((req, _)) => {
+                    self.further_calls.push_front(req);
+                    break;
+                },
             }
-            self.active.push(Box::new({
-                rx.map_err(Into::into)
-                    .and_then(|f| f)
-            }));
         }
+        let () = try_ready!(self.further_calls_tx.poll_complete());
+        Ok(Async::Ready(()))
     }
 
     fn do_poll(&mut self) -> Poll<(), Ac::Error> {
-        loop {
-            match self.remote_rx.as_mut().map(Stream::poll) {
-                Some(Ok(Async::Ready(Some(scrundle)))) =>
-                    self.merge_scrundle(scrundle),
-                Some(Ok(Async::NotReady)) |
-                None => break,
-                Some(Ok(Async::Ready(None))) |
-                Some(Err(())) => {
-                    self.remote_rx = None;
-                    break;
-                },
-            } {}
+        let () = try_ready!(self.do_calls_send().map_err(|_| Canceled.into()));
+        while let Some((scrundle_opt, stream_opt)) = try_ready!(self.active.poll()) {
+            if let Some(scrundle) = scrundle_opt {
+                self.merge_scrundle(scrundle);
+            }
+            if let Some(stream) = stream_opt {
+                self.active.push(Box::new({
+                    stream_into_step_future(stream)
+                        .map(|(sc, st)| (sc, Some(st)))
+                }));
+            }
         }
-        while let Some(scrundle) = try_ready!(self.active.poll()) {
-            self.merge_scrundle(scrundle);
-        }
-        if self.remote_rx.is_none() {
-            Ok(Async::Ready(()))
-        } else {
-            Ok(Async::NotReady)
-        }
+        Ok(Async::Ready(()))
     }
 }
 
@@ -748,8 +732,8 @@ impl<Ac> Future for ScrundleDrainingFuture<Ac>
 
 pub struct ScrundleActor<Ac: 'static + ScrundleCapable> {
     actor: Ac,
-    further_calls_tx: mpsc::UnboundedSender<FurtherCall<Ac>>,
-    further_calls_rx: mpsc::UnboundedReceiver<FurtherCall<Ac>>,
+    further_calls_tx: mpsc::Sender<FurtherCall<Ac>>,
+    further_calls_rx: mpsc::Receiver<FurtherCall<Ac>>,
 }
 
 impl<Ac> ScrundleActor<Ac>
@@ -757,21 +741,22 @@ impl<Ac> ScrundleActor<Ac>
           Ac::Request: fmt::Debug,
           Ac::Error: From<kabuki::CallError<Ac::Iter>> + From<Canceled>,
 {
-    pub fn new(actor: Ac) -> Self {
-        let (further_calls_tx, further_calls_rx) = mpsc::unbounded();
+    pub fn new(actor: Ac, buffer: usize) -> Self {
+        let (further_calls_tx, further_calls_rx) = mpsc::channel(buffer);
         ScrundleActor { actor, further_calls_tx, further_calls_rx }
     }
 
-    fn poll_further_calls(&mut self) {
+    fn poll_further_calls(&mut self) -> kabuki::ActorState {
         loop {
             match self.further_calls_rx.poll() {
                 Ok(Async::Ready(Some((req, tx)))) => {
-                    let resp = self.actor.call(req);
-                    let _ = tx.send(resp);
+                    if !tx.is_canceled() {
+                        let resp = self.actor.call(req);
+                        let _ = tx.send(resp);
+                    }
                 },
-                Ok(Async::NotReady) => return,
-
-                Ok(Async::Ready(None)) |
+                Ok(Async::Ready(None)) => return kabuki::ActorState::Finalizing,
+                Ok(Async::NotReady) => return kabuki::ActorState::Listening,
                 Err(()) => unreachable!(),
             }
         }
@@ -792,48 +777,14 @@ impl<Ac> Actor for ScrundleActor<Ac>
         ScrundleDrainingFuture::new(self.further_calls_tx.clone(), reqs)
     }
 
-    fn poll(&mut self, state: kabuki::ActorState) -> Async<()> {
-        self.poll_further_calls();
+    fn poll(&mut self, mut state: kabuki::ActorState) -> Async<()> {
+        if self.poll_further_calls() == kabuki::ActorState::Finalizing {
+            state = kabuki::ActorState::Finalizing;
+        }
         self.actor.poll(state)
     }
 
     fn poll_ready(&mut self) -> Async<()> {
         self.actor.poll_ready()
     }
-}
-
-pub struct WithSync<Se, U, F>
-    where Se: Service,
-          F: Fn(U) -> Result<Se::Request, Se::Error>,
-{
-    service: Se,
-    func: F,
-    _ty: PhantomData<fn(U)>,
-}
-
-impl<Se, U, F> Service for WithSync<Se, U, F>
-    where Se: Service,
-          Se::Error: 'static,
-          Se::Future: 'static,
-          U: 'static,
-          F: Fn(U) -> Result<Se::Request, Se::Error>,
-{
-    type Request = U;
-    type Response = Se::Response;
-    type Error = Se::Error;
-    type Future = Box<Future<Item = Self::Response, Error = Self::Error>>;
-
-    fn call(&self, u: Self::Request) -> Self::Future {
-        Box::new({
-            future::result((self.func)(u).map(|req| self.service.call(req)))
-                .and_then(|fut| fut)
-        })
-    }
-}
-
-pub fn with_sync<Se, U, F>(service: Se, func: F) -> WithSync<Se, U, F>
-    where Se: Service,
-          F: Fn(U) -> Result<Se::Request, Se::Error>,
-{
-    WithSync { service, func, _ty: PhantomData }
 }
