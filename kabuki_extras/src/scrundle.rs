@@ -92,8 +92,8 @@ impl<Req, E> ScrundleRemotes<Req, E>
     where Req: 'static,
           E: 'static,
 {
-    fn new() -> Self {
-        let (tx, rx) = mpsc::channel(5);
+    fn new(buffer: usize) -> Self {
+        let (tx, rx) = mpsc::channel(buffer);
         ScrundleRemotes { tx: tx, rxv: vec![Box::new({
             rx.map_err(|()| unreachable!())
         })] }
@@ -103,7 +103,8 @@ impl<Req, E> ScrundleRemotes<Req, E>
         where E: Into<E2>,
               E2: 'static,
     {
-        let mut ret = ScrundleRemotes::<Req, E2>::new();
+        // XXX
+        let mut ret = ScrundleRemotes::<Req, E2>::new(self.rxv.len());
         ret.rxv.extend({
             self.rxv.into_iter()
                 .map(|stream| Box::new({
@@ -147,7 +148,8 @@ impl<E> ScrundleRemotes<Void, E>
               E: Into<E2>,
               E2: 'static,
     {
-        let mut ret = ScrundleRemotes::<Req, E2>::new();
+        // XXX
+        let mut ret = ScrundleRemotes::<Req, E2>::new(self.rxv.len());
         ret.rxv.extend({
             self.rxv.into_iter()
                 .map(|stream| Box::new({
@@ -223,11 +225,11 @@ impl<Req, E> Scrundle<Req, E>
         Default::default()
     }
 
-    pub fn remote(&mut self) -> RemoteScrundle<Req, E> {
+    pub fn remote(&mut self, buffer: usize) -> RemoteScrundle<Req, E> {
         match &mut self.remote {
             &mut Some(ref remotes) => remotes.create_remote(),
             r => {
-                let remotes = ScrundleRemotes::new();
+                let remotes = ScrundleRemotes::new(buffer);
                 let ret = remotes.create_remote();
                 *r = Some(remotes);
                 ret
@@ -635,12 +637,16 @@ impl<Req, E> Sink for RemoteScrundle<Req, E>
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct BatchedErrors<E>(pub Vec<E>);
+
 pub struct ScrundleDrainingFuture<Ac>
     where Ac: 'static + ScrundleCapable
 {
     further_calls_tx: mpsc::Sender<FurtherCall<Ac>>,
     further_calls: VecDeque<Ac::Request>,
     active: stream::FuturesUnordered<NextScrundleMaybeStreamFuture<Ac::Request, Ac::Error>>,
+    batched_failures: Vec<Ac::Error>,
 }
 
 impl<Ac> ScrundleDrainingFuture<Ac>
@@ -653,6 +659,7 @@ impl<Ac> ScrundleDrainingFuture<Ac>
             further_calls_tx,
             further_calls: calls.into_iter().collect(),
             active: stream::FuturesUnordered::new(),
+            batched_failures: vec![],
         }
     }
 
@@ -702,6 +709,7 @@ impl<Ac> ScrundleDrainingFuture<Ac>
 
     fn do_poll(&mut self) -> Poll<(), Ac::Error> {
         let () = try_ready!(self.do_calls_send().map_err(|_| Canceled.into()));
+        // Make sure all calls are sent before awaiting anything.
         while let Some((scrundle_opt, stream_opt)) = try_ready!(self.active.poll()) {
             if let Some(scrundle) = scrundle_opt {
                 self.merge_scrundle(scrundle);
@@ -715,18 +723,31 @@ impl<Ac> ScrundleDrainingFuture<Ac>
         }
         Ok(Async::Ready(()))
     }
+
+    fn do_trapping_poll(&mut self) -> Poll<(), Ac::Error> {
+        loop {
+            match self.do_poll() {
+                Err(e) => self.batched_failures.push(e),
+                ok => return ok,
+            }
+        }
+    }
 }
 
 impl<Ac> Future for ScrundleDrainingFuture<Ac>
     where Ac: ScrundleCapable + 'static,
           Ac::Request: fmt::Debug,
-          Ac::Error: From<Canceled>,
+          Ac::Error: From<Canceled> + From<BatchedErrors<Ac::Error>>,
 {
     type Item = ();
     type Error = Ac::Error;
 
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        self.do_poll()
+        let () = try_ready!(self.do_trapping_poll());
+        match mem::replace(&mut self.batched_failures, vec![]) {
+            ref v if v.is_empty() => Ok(Async::Ready(())),
+            v => Err(BatchedErrors(v).into())
+        }
     }
 }
 
@@ -766,7 +787,7 @@ impl<Ac> ScrundleActor<Ac>
 impl<Ac> Actor for ScrundleActor<Ac>
     where Ac: ScrundleCapable + 'static,
           Ac::Request: fmt::Debug,
-          Ac::Error: From<kabuki::CallError<Ac::Iter>> + From<Canceled>,
+          Ac::Error: From<kabuki::CallError<Ac::Iter>> + From<Canceled> + From<BatchedErrors<Ac::Error>>,
 {
     type Request = Ac::Iter;
     type Response = ();
