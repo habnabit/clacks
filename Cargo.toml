@@ -5,4 +5,7 @@ members = [
     "clacks_mtproto",
     "clacks_tl_codegen",
     "clacks_transport",
+    "keyring-rs",
+    "rust-security-framework/security-framework-sys",
+    "rust-security-framework/security-framework",
 ]
