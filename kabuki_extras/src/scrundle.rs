@@ -1,7 +1,6 @@
 use futures::{Async, AsyncSink, Canceled, Future, IntoFuture, Poll, Sink, StartSend, Stream, stream};
 use futures::unsync::{mpsc, oneshot};
 use kabuki::{self, Actor, ActorRef};
-use slog::Logger;
 use smallvec::{Array, SmallVec};
 use std::{fmt, mem};
 use std::collections::VecDeque;
@@ -27,7 +26,6 @@ pub type ActorRSL<Ac> = RemoteScrundle<<Ac as Actor>::Request, <Ac as Actor>::Er
 pub type ScrundleActorExternal<Ac> = ActorRef<
     <Ac as ScrundleCapable>::Iter, (), <Ac as Actor>::Error>;
 
-type ActorSLS<Ac> = ScrundleStream<<Ac as Actor>::Request, <Ac as Actor>::Error>;
 type NextScrundleStream<Req, E> = Box<Stream<Item = Scrundle<Req, E>, Error = E>>;
 type NextScrundle<Req, E> = (Option<Scrundle<Req, E>>, NextScrundleStream<Req, E>);
 type NextScrundleFuture<Req, E> = Box<Future<Item = NextScrundle<Req, E>, Error = E>>;
@@ -39,22 +37,6 @@ pub trait ScrundleCapable: Actor<Response = ActorSL<Self>>
           Self::Error: 'static,
 {
     type Iter: IntoIterator<Item = Self::Request>;
-}
-
-pub fn ready_to_end(state: kabuki::ActorState) -> Async<()> {
-    if state == kabuki::ActorState::Listening {
-        Async::NotReady
-    } else {
-        Async::Ready(())
-    }
-}
-
-pub fn least_ready(a: Async<()>, b: Async<()>) -> Async<()> {
-    use futures::Async::*;
-    match (a, b) {
-        (Ready(()), Ready(())) => Ready(()),
-        _ => NotReady,
-    }
 }
 
 pub fn smallvec_one<T, Arr>(item: T) -> SmallVec<Arr>
