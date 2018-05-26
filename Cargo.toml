@@ -8,6 +8,7 @@ members = [
     "kabuki",
     "kabuki_extras",
     "keyring-rs",
+    "rust-delegate",
     "rust-security-framework/security-framework-sys",
     "rust-security-framework/security-framework",
 ]
