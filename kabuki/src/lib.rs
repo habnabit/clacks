@@ -22,17 +22,12 @@
 // - Use UnparkEvent once in-flight passes some threshold
 // - Conditionally depend on tokio-core
 
+#[macro_use] extern crate scoped_tls;
 extern crate futures;
-extern crate futures_spawn;
-extern crate futures_mpsc;
-#[macro_use]
-extern crate scoped_tls;
 extern crate tokio_service;
 
 use futures::{Future, Stream, IntoFuture, Async, AsyncSink, Sink, Poll, future};
-use futures::sync::oneshot;
-use futures_spawn::Spawn;
-use futures_mpsc as mpsc;
+use futures::sync::{mpsc, oneshot};
 use tokio_service::Service;
 
 use std::mem;
@@ -249,24 +244,24 @@ impl Builder {
     }
 
     /// Spawn a new actor
-    pub fn spawn<A, S>(self, s: &S, actor: A)
-        -> ActorRef<A::Request, A::Response, A::Error>
-        where A: Actor,
-              S: Spawn<ActorCell<A>>,
+    pub fn spawn<A, E>(self, e: &E, actor: A) -> Result<ActorRefOf<A>, future::ExecuteErrorKind>
+        where A: Actor + 'static,
+              E: future::Executor<Box<Future<Item = (), Error = ()>>>,
     {
-        let (tx, rx) = self.pair(actor);
-        s.spawn_detached(rx);
-        tx
+        let (actor_ref, actor_cell) = self.pair(actor);
+        e.execute(Box::new(actor_cell))
+            .map(|()| actor_ref)
+            .map_err(|e| e.kind())
     }
 
     /// Spawn the given closure as an actor
-    pub fn spawn_fn<F, T: 'static, U: 'static, S>(self, s: &S, f: F)
-        -> ActorRef<T, U::Item, U::Error>
-        where F: Fn(T) -> U,
-              U: IntoFuture,
-              S: Spawn<ActorCell<ActorFn<F, T>>>,
+    pub fn spawn_fn<F, T, U, E>(self, e: &E, f: F) -> Result<ActorRef<T, U::Item, U::Error>, future::ExecuteErrorKind>
+        where F: Fn(T) -> U + 'static,
+              T: 'static,
+              U: IntoFuture + 'static,
+              E: future::Executor<Box<Future<Item = (), Error = ()>>>,
     {
-        self.spawn(s, actor_fn(f))
+        self.spawn(e, actor_fn(f))
     }
 
     fn pair<A>(self, actor: A) -> (ActorRefOf<A>, ActorCell<A>)
@@ -319,14 +314,6 @@ impl<F, T: 'static, U: 'static> Actor for ActorFn<F, T>
  *
  */
 
-impl<T, U, E> ActorRef<T, U, E>
-    where E: From<CallError<T>>,
-{
-    /// Returns `Async::Ready` when the actor can accept a new request
-    pub fn poll_ready(&mut self) -> Async<()> {
-        (self.0).0.poll_ready()
-    }
-}
 
 impl<T: 'static, U: 'static, E: 'static> ActorRef<T, U, E>
     where E: From<CallError<T>>,
