@@ -1,3 +1,4 @@
+#![warn(unused_extern_crates)]
 #![feature(proc_macro, generators)]
 
 #[macro_use] extern crate slog;

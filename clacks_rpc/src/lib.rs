@@ -1,18 +1,15 @@
+#![deny(private_in_public, unused_extern_crates)]
 #![recursion_limit = "128"]
 
 #[macro_use] extern crate error_chain;
 #[macro_use] extern crate kabuki_extras;
 #[macro_use] extern crate slog;
-extern crate byteorder;
-extern crate bytes;
-extern crate chrono;
 extern crate clacks_crypto;
 extern crate clacks_mtproto;
 extern crate clacks_transport;
 extern crate flate2;
 extern crate futures;
 extern crate kabuki;
-extern crate rand;
 extern crate tokio_io;
 extern crate tokio_service;
 

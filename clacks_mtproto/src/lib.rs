@@ -1,4 +1,5 @@
-#![recursion_limit = "80000"]
+#![deny(private_in_public, unused_extern_crates)]
+#![recursion_limit = "512"]
 
 #[macro_use] extern crate erased_serde;
 #[macro_use] extern crate error_chain;

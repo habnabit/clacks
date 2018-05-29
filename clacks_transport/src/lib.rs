@@ -1,3 +1,4 @@
+#![deny(private_in_public, unused_extern_crates)]
 #![recursion_limit = "128"]
 
 #[macro_use] extern crate error_chain;
@@ -12,7 +13,6 @@ extern crate kabuki;
 extern crate kabuki_extras;
 extern crate rand;
 extern crate tokio_io;
-extern crate tokio_service;
 
 pub mod error {
     error_chain! {

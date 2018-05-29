@@ -1,3 +1,4 @@
+#![deny(private_in_public, unused_extern_crates)]
 #![feature(proc_macro, generators)]
 
 extern crate byteorder;

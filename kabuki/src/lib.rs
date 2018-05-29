@@ -16,7 +16,7 @@
 //! lightweight task primitive. However, it leaves the details of managing
 //! concurrency up to the developer.
 
-#![deny(missing_docs)]
+#![deny(missing_docs, private_in_public, unused_extern_crates)]
 
 // TODO:
 // - Use UnparkEvent once in-flight passes some threshold

@@ -1,3 +1,4 @@
+#![deny(private_in_public, unused_extern_crates)]
 #![recursion_limit = "128"]
 
 #[cfg(feature = "rustfmt-codegen")]
