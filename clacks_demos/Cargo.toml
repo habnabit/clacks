@@ -18,7 +18,7 @@ tokio-io = "*"
 
 [dependencies.clacks_mtproto]
 path = "../clacks_mtproto"
-version = "0.0.5"
+version = "0.73.0"
 
 [dependencies.clacks_crypto]
 path = "../clacks_crypto"

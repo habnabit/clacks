@@ -1,6 +1,6 @@
 [package]
 name = "clacks_mtproto"
-version = "0.0.5"
+version = "0.73.0"
 authors = ["Aaron Gallagher <_@habnab.it>", "Connie Hilarides <connorcpu@live.com>"]
 license = "MIT/Apache-2.0"
 description = "minimal wrappers for telegram's mtproto serialization"

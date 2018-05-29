@@ -159,18 +159,18 @@ pub trait IntoBoxed: BareSerialize {
     fn into_boxed(self) -> Self::Boxed;
 }
 
-pub trait AnyBoxedSerialize: Any + BoxedSerialize + erased_serde::Serialize {
+pub trait AnyBoxedSerialize: Any + Send + BoxedSerialize + erased_serde::Serialize {
     fn as_any(&self) -> &Any;
-    fn into_boxed_any(self: Box<Self>) -> Box<Any>;
+    fn into_boxed_any(self: Box<Self>) -> Box<Any + Send>;
 }
 
-impl<T: Any + BoxedSerialize + erased_serde::Serialize> AnyBoxedSerialize for T {
+impl<T: Any + Send + BoxedSerialize + erased_serde::Serialize> AnyBoxedSerialize for T {
     fn as_any(&self) -> &Any { self }
-    fn into_boxed_any(self: Box<Self>) -> Box<Any> { self }
+    fn into_boxed_any(self: Box<Self>) -> Box<Any + Send> { self }
 }
 
 serialize_trait_object!(AnyBoxedSerialize);
 
 pub trait Function: AnyBoxedSerialize + serde::Serialize {
-    type Reply: BoxedDeserialize;
+    type Reply: BoxedDeserialize + AnyBoxedSerialize;
 }
