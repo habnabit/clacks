@@ -4,13 +4,20 @@ version = "0.1.0"
 authors = ["Aaron Gallagher <_@habnab.it>"]
 
 [dependencies]
+bytes = "*"
 debug_stub_derive = "*"
 futures = "0.1"
 slog = "*"
 smallvec = "*"
+tokio-io = "*"
 tokio-service = "*"
+tokio-tcp = "*"
 void = "*"
 
 [dependencies.kabuki]
 path = "../kabuki"
 version = "0.0.2"
+
+[dependencies.delegate]
+path = "../rust-delegate"
+version = "0.1.2"

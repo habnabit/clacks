@@ -1,10 +1,9 @@
-use futures::{Async, AsyncSink, Canceled, Future, IntoFuture, Poll, Sink, Stream, future, stream};
+use futures::{Async, AsyncSink, Canceled, IntoFuture, Poll, Sink, Stream, future, stream};
 use futures::future::FutureResult;
 use futures::unsync::oneshot;
 use kabuki::{self, Actor};
 use slog::Logger;
 use std::fmt;
-use tokio_service::Service;
 
 
 pub trait AsyncReady where Self: Sized {
@@ -41,57 +40,10 @@ pub fn ready_to_end(state: kabuki::ActorState) -> Async<()> {
     }
 }
 
-pub type BoxService<Req, Res, E> = Box<Service<Request = Req, Response = Res, Error = E,
-                                           Future = Box<Future<Item = Res, Error = E>>>>;
-
-pub struct ErasedService<Se>(Se)
-    where Se: Service,
-          Se::Future: 'static;
-
-impl<Se> ErasedService<Se>
-    where Se: Service + 'static,
-          Se::Future: 'static,
-{
-    pub fn new_erased(service: Se) -> BoxService<Se::Request, Se::Response, Se::Error> {
-        Box::new(ErasedService(service))
-    }
-}
-
-impl<Se> Service for ErasedService<Se>
-    where Se: Service,
-          Se::Future: 'static,
-{
-    type Request = Se::Request;
-    type Response = Se::Response;
-    type Error = Se::Error;
-    type Future = Box<Future<Item = Self::Response, Error = Self::Error>>;
-
-    fn call(&self, req: Self::Request) -> Self::Future {
-        Box::new(self.0.call(req))
-    }
-}
-
 #[derive(Debug)]
 pub struct SinkErrored<E>(pub E);
 #[derive(Debug)]
 pub struct SinkFull<T>(pub T);
-
-#[derive(Debug)]
-enum CloseState<W> {
-    Waiting(W),
-    CloseNotReady,
-    Closed,
-}
-
-impl<W> CloseState<W> {
-    fn erase_waiting(&self) -> CloseState<()> {
-        match self {
-            &CloseState::Waiting(_) => CloseState::Waiting(()),
-            &CloseState::CloseNotReady => CloseState::CloseNotReady,
-            &CloseState::Closed => CloseState::Closed,
-        }
-    }
-}
 
 pub struct SinkActor<Si, EH> {
     log: Logger,
@@ -100,8 +52,8 @@ pub struct SinkActor<Si, EH> {
 
 struct SinkActorInner<Si, EH> {
     sink: Si,
-    close_state: CloseState<oneshot::Receiver<()>>,
     error_handler: oneshot::Sender<EH>,
+    force_close: bool,
 }
 
 impl<Si, EH> SinkActorInner<Si, EH>
@@ -110,33 +62,23 @@ impl<Si, EH> SinkActorInner<Si, EH>
           Si::SinkError: From<SinkFull<Si::SinkItem>> + From<Canceled> + 'static,
           EH: fmt::Debug + From<SinkErrored<Si::SinkError>> + 'static,
 {
-    fn poll_close(&mut self) -> Poll<(), Si::SinkError> {
-        loop {
-            self.close_state = match self.close_state {
-                CloseState::Waiting(ref mut f) => {
-                    let () = try_ready!(f.poll());
-                    CloseState::CloseNotReady
-                },
-                CloseState::CloseNotReady => {
-                    let () = try_ready!(self.sink.close());
-                    CloseState::Closed
-                },
-                CloseState::Closed => return Ok(Async::Ready(())),
-            };
+    fn poll_maybe_close(&mut self, state: kabuki::ActorState) -> Poll<(), Si::SinkError> {
+        let () = try_ready!(self.sink.poll_complete());
+        if self.force_close || state == kabuki::ActorState::Finalizing {
+            self.sink.close()
+        } else {
+            Ok(Async::NotReady)
         }
     }
 
     fn force_close(&mut self) {
-        if let CloseState::Waiting(_) = self.close_state {
-            self.close_state = CloseState::CloseNotReady;
-        }
+        self.force_close = true;
     }
 }
 
 pub struct PreparedSinkActor<Ac, EH> {
     pub actor: Ac,
     pub error_rx: oneshot::Receiver<EH>,
-    pub close_tx: oneshot::Sender<()>,
 }
 
 impl<Si, EH> SinkActor<Si, EH>
@@ -147,14 +89,10 @@ impl<Si, EH> SinkActor<Si, EH>
 {
     pub fn new(log: Logger, sink: Si) -> PreparedSinkActor<Self, EH> {
         let (error_handler, error_rx) = oneshot::channel();
-        let (close_tx, close_rx) = oneshot::channel();
         let actor = SinkActor {
-            log, inner: Some(SinkActorInner {
-                sink, error_handler,
-                close_state: CloseState::Waiting(close_rx),
-            }),
+            log, inner: Some(SinkActorInner { sink, error_handler, force_close: false }),
         };
-        PreparedSinkActor { actor, error_rx, close_tx }
+        PreparedSinkActor { actor, error_rx }
     }
 
     fn enqueue(&mut self, item: Si::SinkItem) -> Result<(), Si::SinkError> {
@@ -168,16 +106,11 @@ impl<Si, EH> SinkActor<Si, EH>
         }
     }
 
-    fn poll_sink(&mut self) -> (Async<()>, CloseState<()>) {
+    fn poll_sink(&mut self, state: kabuki::ActorState) -> Async<()> {
         let log = &self.log;
         let mut fatal_error_opt: Option<EH> = None;
         let ret = if let Some(ref mut inner) = self.inner {
-            inner.sink
-                .poll_complete()
-                .and_then(|a| {
-                    let _: Async<()> = inner.poll_close()?;
-                    Ok((a, inner.close_state.erase_waiting()))
-                })
+            inner.poll_maybe_close(state)
                 .map_err(|e| -> () {
                     let e = SinkErrored(e).into();
                     debug!(log, "sink failure"; "error" => ?e);
@@ -187,7 +120,7 @@ impl<Si, EH> SinkActor<Si, EH>
                 .ok()
         } else {
             None
-        }.unwrap_or((Async::NotReady, CloseState::Closed));
+        }.unwrap_or(Async::Ready(()));
         if let Some(fatal_error) = fatal_error_opt {
             match self.inner.take() {
                 Some(inner_cell) => {
@@ -216,19 +149,7 @@ impl<Si, EH> Actor for SinkActor<Si, EH>
     }
 
     fn poll(&mut self, state: kabuki::ActorState) -> Async<()> {
-        let (sink_flushed, sink_closed) = self.poll_sink();
-        match sink_closed {
-            CloseState::CloseNotReady => Async::NotReady,
-            _ => sink_flushed.or_less_ready(|| ready_to_end(state)),
-        }
-    }
-
-    fn poll_ready(&mut self) -> Async<()> {
-        let (sink_flushed, sink_closed) = self.poll_sink();
-        match sink_closed {
-            CloseState::Waiting(()) => sink_flushed,
-            _ => Async::NotReady,
-        }
+        self.poll_sink(state)
     }
 }
 
