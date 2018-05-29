@@ -1,6 +1,7 @@
 use chrono::{DateTime, Duration, Utc, Timelike, TimeZone};
+use clacks_crypto::CSRNG;
 use clacks_crypto::symm::AuthKey;
-use clacks_mtproto::{AnyBoxedSerialize, BareSerialize, IntoBoxed, mtproto};
+use clacks_mtproto::{AnyBoxedSerialize, BareSerialize, BoxedSerialize, ConstructorNumber, IntoBoxed, mtproto};
 use clacks_mtproto::mtproto::wire::outbound_encrypted::OutboundEncrypted;
 use byteorder::{LittleEndian, ByteOrder, ReadBytesExt};
 use rand::Rng;
@@ -47,13 +48,55 @@ pub struct Session {
     seq_no: i32,
     auth_key: Option<AuthKey>,
     to_ack: Vec<i64>,
-    pub app_id: AppId,
+    app_id: AppId,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
+enum OutboundMessageWithoutId {
+    Plain(mtproto::TLObject),
+    Encrypted(mtproto::TLObject),
+    BindPermKey { perm_key: AuthKey, expires_at: i32 },
+}
+
+#[derive(Debug)]
 pub struct OutboundMessage {
-    pub message_id: i64,
-    pub message: Vec<u8>,
+    message_id: i64,
+    inner: OutboundMessageWithoutId,
+}
+
+impl OutboundMessage {
+    fn from_inner(inner: OutboundMessageWithoutId) -> Self {
+        OutboundMessage { inner, message_id: CSRNG.gen() }
+    }
+
+    pub fn plain<P>(payload: P) -> Self
+        where P: AnyBoxedSerialize,
+    {
+        Self::from_inner(OutboundMessageWithoutId::Plain(mtproto::TLObject::new(payload)))
+    }
+
+    pub fn encrypted<P>(payload: P) -> Self
+        where P: AnyBoxedSerialize,
+    {
+        Self::from_inner(OutboundMessageWithoutId::Encrypted(mtproto::TLObject::new(payload)))
+    }
+
+    pub fn bind_temp_auth_key(perm_key: AuthKey, expires_at: i32) -> Self {
+        Self::from_inner(OutboundMessageWithoutId::BindPermKey { perm_key, expires_at })
+    }
+
+    pub fn message_id(&self) -> i64 {
+        self.message_id
+    }
+
+    pub fn constructor(&self) -> ConstructorNumber {
+        use self::OutboundMessageWithoutId::*;
+        match self.inner {
+            Plain(ref o) |
+            Encrypted(ref o) => o.serialize_boxed().0,
+            BindPermKey {..} => unimplemented!(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -65,9 +108,10 @@ pub struct InboundMessage {
 }
 
 impl Session {
-    pub fn new(session_id: i64, app_id: AppId) -> Session {
+    pub fn new(app_id: AppId) -> Session {
         Session {
-            session_id, app_id,
+            app_id,
+            session_id: CSRNG.gen(),
             temp_session_id: None,
             server_salts: vec![],
             seq_no: 0,
@@ -118,6 +162,14 @@ impl Session {
         self.to_ack.push(id);
     }
 
+    fn plain_payload(&mut self, payload: mtproto::TLObject, message_id: i64) -> Result<Vec<u8>> {
+        Ok(mtproto::wire::outbound_raw::OutboundRaw {
+            message_id,
+            auth_key_id: 0,
+            payload: payload.into(),
+        }.bare_serialized_bytes()?)
+    }
+
     fn pack_message_container<I>(&mut self, payloads: I) -> mtproto::manual::MessageContainer
         where I: IntoIterator<Item = (bool, mtproto::TLObject)>,
     {
@@ -142,63 +194,49 @@ impl Session {
         }
     }
 
-    fn encrypted_payload_inner(&mut self, payload: mtproto::TLObject, content_message: bool) -> Result<OutboundMessage> {
-        let key = self.fresh_auth_key()?;
+    fn encrypted_payload_inner(&mut self, payload: mtproto::TLObject, key: Option<AuthKey>, message_id: i64, content_message: bool) -> Result<Vec<u8>> {
+        let key = key.map(Ok).unwrap_or_else(|| self.fresh_auth_key())?;
         let salt = self.latest_server_salt()?;
-        let message_id = next_message_id();
         let message = OutboundEncrypted {
             salt, message_id,
             session_id: self.session_id,
             seq_no: self.next_seq_no(content_message),
             payload: payload.into(),
         };
-        Ok(OutboundMessage {
-            message_id, message: key.encrypt_message(message)?,
-        })
+        Ok(key.encrypt_message(message)?)
     }
 
-    fn pack_encrypted_payload_with_acks(&mut self, payload: mtproto::TLObject) -> Result<OutboundMessage> {
+    fn pack_encrypted_payload_with_acks(&mut self, payload: mtproto::TLObject, message_id: i64) -> Result<Vec<u8>> {
         let acks = mtproto::TLObject::new(mtproto::msgs_ack::MsgsAck {
             msg_ids: mem::replace(&mut self.to_ack, vec![]).into(),
         }.into_boxed());
         let combined = self.pack_message_container(vec![(false, acks), (true, payload)]);
-        // The message id of the interior message which was 'payload'.
-        let message_id = combined.messages()[1].msg_id;
-        let mut ret = self.encrypted_payload_inner(mtproto::TLObject::new(combined), false)?;
-        ret.message_id = message_id;
-        Ok(ret)
+        self.encrypted_payload_inner(mtproto::TLObject::new(combined), None, message_id, false)
     }
 
-    pub fn encrypted_payload<P>(&mut self, payload: P) -> Result<OutboundMessage>
-        where P: AnyBoxedSerialize,
-    {
-        let payload = mtproto::TLObject::new(payload);
+    fn encrypted_payload(&mut self, payload: mtproto::TLObject, message_id: i64) -> Result<Vec<u8>> {
         if self.to_ack.is_empty() {
-            self.encrypted_payload_inner(payload, true)
+            self.encrypted_payload_inner(payload, None, message_id, true)
         } else {
-            self.pack_encrypted_payload_with_acks(payload)
+            self.pack_encrypted_payload_with_acks(payload, message_id)
         }
     }
 
-    pub fn plain_payload<P>(&mut self, payload: P) -> Result<OutboundMessage>
-        where P: AnyBoxedSerialize,
-    {
-        let message_id = next_message_id();
-        let message = mtproto::wire::outbound_raw::OutboundRaw {
-            message_id,
-            auth_key_id: 0,
-            payload: mtproto::TLObject::new(payload).into(),
-        }.bare_serialized_bytes()?;
-        Ok(OutboundMessage { message_id, message })
+    fn bind_auth_key(&mut self, perm_key: AuthKey, expires_at: i32, message_id: i64) -> Result<Vec<u8>> {
+        let temp_key = self.fresh_auth_key()?;
+        let (temp_session_id, bind_message) = perm_key.bind_temp_auth_key(
+            &temp_key, expires_at, message_id, &mut CSRNG)?;
+        self.temp_session_id = Some(temp_session_id);
+        self.encrypted_payload_inner(mtproto::TLObject::new(bind_message), Some(temp_key), message_id, true)
     }
 
-    pub fn assemble_payload<P>(&mut self, payload: P, encrypt: bool) -> Result<OutboundMessage>
-        where P: AnyBoxedSerialize,
-    {
-        if encrypt {
-            self.encrypted_payload(payload)
-        } else {
-            self.plain_payload(payload)
+    pub fn serialize_message(&mut self, message: OutboundMessage) -> Result<Vec<u8>> {
+        use self::OutboundMessageWithoutId::*;
+        let OutboundMessage { message_id, inner } = message;
+        match inner {
+            Plain(p) => self.plain_payload(p, message_id),
+            Encrypted(p) => self.encrypted_payload(p, message_id),
+            BindPermKey { perm_key, expires_at } => self.bind_auth_key(perm_key, expires_at, message_id),
         }
     }
 
@@ -245,25 +283,6 @@ impl Session {
             message_id: inbound.message_id,
             was_encrypted: true,
             seq_no: Some(inbound.seq_no),
-        })
-    }
-
-    pub fn bind_from_permanent_auth_key<R: Rng>(&mut self, perm_key: AuthKey, expires_at: i32, rng: &mut R)
-                                                -> Result<OutboundMessage> {
-        let temp_key = self.fresh_auth_key()?;
-        let salt = self.latest_server_salt()?;
-        let message_id = next_message_id();
-        let (temp_session_id, bind_message) = perm_key.bind_temp_auth_key(&temp_key, expires_at, message_id, rng)?;
-        let message = OutboundEncrypted {
-            salt, message_id,
-            session_id: temp_session_id,
-            seq_no: self.next_seq_no(true),
-            payload: mtproto::TLObject::new(bind_message).into(),
-        };
-        self.temp_session_id = Some(temp_session_id);
-        Ok(OutboundMessage {
-            message_id,
-            message: temp_key.encrypt_message(message)?,
         })
     }
 }

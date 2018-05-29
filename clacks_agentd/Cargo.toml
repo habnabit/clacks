@@ -1,0 +1,48 @@
+[package]
+name = "clacks_agentd"
+version = "0.0.1"
+authors = ["Aaron Gallagher <_@habnab.it>"]
+
+[dependencies]
+byteorder = "*"
+chrono = "*"
+error-chain = "*"
+futures = "0.1"
+futures-await = "*"
+rand = "*"
+serde = "1.0"
+serde_json = "*"
+slog = "*"
+slog-async = "*"
+slog-envlogger = "*"
+slog-scope = "*"
+slog-term = "*"
+tokio = "*"
+tokio-io = "*"
+
+[dependencies.clacks_mtproto]
+path = "../clacks_mtproto"
+version = "0.73.0"
+
+[dependencies.clacks_crypto]
+path = "../clacks_crypto"
+version = "0.0.5"
+
+[dependencies.clacks_transport]
+path = "../clacks_transport"
+version = "0.0.5"
+
+[dependencies.clacks_rpc]
+path = "../clacks_rpc"
+version = "0.0.5"
+
+[dependencies.kabuki]
+path = "../kabuki"
+version = "*"
+
+[dependencies.kabuki_extras]
+path = "../kabuki_extras"
+version = "*"
+
+[dependencies.sexpr]
+git = "https://github.com/zshipko/sexpr"

@@ -1,5 +1,5 @@
 [package]
-name = "clacks_transport"
+name = "clacks_rpc"
 version = "0.0.5"
 authors = ["Aaron Gallagher <_@habnab.it>", "Connie Hilarides <connorcpu@live.com>"]
 license = "MIT/Apache-2.0"
@@ -10,6 +10,7 @@ byteorder = "1.2"
 bytes = "0.4"
 chrono = "0.4"
 error-chain = "0.11"
+flate2 = "*"
 futures = "0.1"
 rand = "0.4"
 slog = "*"
@@ -22,6 +23,10 @@ version = "0.73.0"
 
 [dependencies.clacks_crypto]
 path = "../clacks_crypto"
+version = "0.0.5"
+
+[dependencies.clacks_transport]
+path = "../clacks_transport"
 version = "0.0.5"
 
 [dependencies.kabuki]

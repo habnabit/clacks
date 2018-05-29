@@ -1,21 +1,25 @@
 use byteorder::{ByteOrder, LittleEndian};
 use bytes::{BufMut, BytesMut};
-use std::{io, mem};
 use tokio_io::codec::{Decoder, Encoder};
+
+use error::{self, Result};
+use session::{InboundMessage, OutboundMessage, Session};
 
 enum LengthState {
     ReadingLength,
-    ReadingBytes { remaining: usize, buf: Vec<u8> },
+    ReadingBytes(usize),
 }
 
 pub struct TelegramCodec {
     sent_leading_byte: bool,
     state: LengthState,
+    session: Session,
 }
 
 impl TelegramCodec {
-    pub fn new() -> TelegramCodec {
+    pub fn new(session: Session) -> TelegramCodec {
         TelegramCodec {
+            session,
             sent_leading_byte: false,
             state: LengthState::ReadingLength,
         }
@@ -23,49 +27,47 @@ impl TelegramCodec {
 }
 
 impl Decoder for TelegramCodec {
-    type Item = Vec<u8>;
-    type Error = io::Error;
+    type Item = InboundMessage;
+    type Error = error::Error;
 
-    fn decode(&mut self, input: &mut BytesMut) -> io::Result<Option<Vec<u8>>> {
+    fn decode(&mut self, input: &mut BytesMut) -> Result<Option<InboundMessage>> {
         use self::LengthState::*;
+        let mut ret: Option<Option<InboundMessage>> = None;
         loop {
             let available = input.len();
-            match &mut self.state {
-                &mut ReadingLength if available < 4 => return Ok(None),
-                state @ &mut ReadingLength => {
+            self.state = match self.state {
+                ReadingLength if available < 4 => {
+                    ret = Some(None);
+                    ReadingLength
+                },
+                ReadingLength => {
                     let length = if input[0] == 0x7f {
                         ((LittleEndian::read_u32(&input.split_to(4)) & !0xff) >> 6) as usize
                     } else {
                         (input.split_to(1)[0] as usize) << 2
                     };
-                    *state = ReadingBytes {
-                        remaining: length,
-                        buf: Vec::with_capacity(length),
-                    };
+                    ReadingBytes(length)
                 },
-                &mut ReadingBytes { ref mut remaining, ref mut buf } if available < *remaining => {
-                    buf.extend(input.split_to(available));
-                    *remaining -= available;
-                    return Ok(None);
+                ReadingBytes(needed) => {
+                    if available < needed { return Ok(None); }
+                    let current = input.split_to(needed);
+                    ret = Some(Some(self.session.process_message(&current)?));
+                    ReadingLength
                 },
-                state => {
-                    if let ReadingBytes { remaining, mut buf } = mem::replace(state, ReadingLength) {
-                        buf.extend(input.split_to(remaining));
-                        return Ok(Some(buf));
-                    } else {
-                        unreachable!()
-                    }
-                },
+            };
+            if let Some(ret) = ret {
+                return Ok(ret);
             }
         }
     }
 }
 
 impl Encoder for TelegramCodec {
-    type Item = Vec<u8>;
-    type Error = io::Error;
+    type Item = OutboundMessage;
+    type Error = error::Error;
 
-    fn encode(&mut self, bytes: Vec<u8>, buf: &mut BytesMut) -> io::Result<()> {
+    fn encode(&mut self, message: OutboundMessage, buf: &mut BytesMut) -> Result<()> {
+        let bytes = self.session.serialize_message(message)?;
         assert!(bytes.len() % 4 == 0);
         buf.reserve(bytes.len() + 5);
         if !self.sent_leading_byte {
