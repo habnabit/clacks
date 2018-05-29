@@ -73,3 +73,25 @@ fn sha1_and_or_pad(input: &[u8], prepend_sha1: bool, padding: Padding) -> ::erro
     }
     Ok(ret)
 }
+
+pub struct CSRNG;
+
+impl rand::Rng for CSRNG {
+    fn next_u32(&mut self) -> u32 {
+        let mut buf = [0u8; 4];
+        self.fill_bytes(&mut buf);
+        <byteorder::NativeEndian as byteorder::ByteOrder>::read_u32(&buf)
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let mut buf = [0u8; 8];
+        self.fill_bytes(&mut buf);
+        <byteorder::NativeEndian as byteorder::ByteOrder>::read_u64(&buf)
+    }
+
+    fn fill_bytes(&mut self, dest: &mut [u8]) {
+        ::openssl::rand::rand_bytes(dest).unwrap();
+    }
+}
+
+pub fn csrng_gen<R: rand::Rand>() -> R { rand::Rand::rand(&mut CSRNG) }
