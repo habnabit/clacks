@@ -1,9 +1,8 @@
 use byteorder::{ByteOrder, LittleEndian};
 use bytes::{BufMut, BytesMut};
+use std::io;
 use tokio_io::codec::{Decoder, Encoder};
 
-use error::{self, Result};
-use session::{InboundMessage, OutboundMessage, Session};
 
 enum LengthState {
     ReadingLength,
@@ -13,13 +12,11 @@ enum LengthState {
 pub struct TelegramCodec {
     sent_leading_byte: bool,
     state: LengthState,
-    session: Session,
 }
 
 impl TelegramCodec {
-    pub fn new(session: Session) -> TelegramCodec {
+    pub fn new() -> TelegramCodec {
         TelegramCodec {
-            session,
             sent_leading_byte: false,
             state: LengthState::ReadingLength,
         }
@@ -27,12 +24,12 @@ impl TelegramCodec {
 }
 
 impl Decoder for TelegramCodec {
-    type Item = InboundMessage;
-    type Error = error::Error;
+    type Item = Vec<u8>;
+    type Error = io::Error;
 
-    fn decode(&mut self, input: &mut BytesMut) -> Result<Option<InboundMessage>> {
+    fn decode(&mut self, input: &mut BytesMut) -> io::Result<Option<Vec<u8>>> {
         use self::LengthState::*;
-        let mut ret: Option<Option<InboundMessage>> = None;
+        let mut ret: Option<Option<Vec<u8>>> = None;
         loop {
             let available = input.len();
             self.state = match self.state {
@@ -51,7 +48,7 @@ impl Decoder for TelegramCodec {
                 ReadingBytes(needed) => {
                     if available < needed { return Ok(None); }
                     let current = input.split_to(needed);
-                    ret = Some(Some(self.session.process_message(&current)?));
+                    ret = Some(Some(current.to_vec()));
                     ReadingLength
                 },
             };
@@ -63,11 +60,10 @@ impl Decoder for TelegramCodec {
 }
 
 impl Encoder for TelegramCodec {
-    type Item = OutboundMessage;
-    type Error = error::Error;
+    type Item = Vec<u8>;
+    type Error = io::Error;
 
-    fn encode(&mut self, message: OutboundMessage, buf: &mut BytesMut) -> Result<()> {
-        let bytes = self.session.serialize_message(message)?;
+    fn encode(&mut self, bytes: Vec<u8>, buf: &mut BytesMut) -> io::Result<()> {
         assert!(bytes.len() % 4 == 0);
         buf.reserve(bytes.len() + 5);
         if !self.sent_leading_byte {

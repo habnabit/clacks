@@ -77,8 +77,8 @@ pub mod error {
         }
     }
 
-    impl From<::kabuki_extras::SinkFull<::clacks_transport::session::OutboundMessage>> for Error {
-        fn from(_: ::kabuki_extras::SinkFull<::clacks_transport::session::OutboundMessage>) -> Self {
+    impl<T> From<::kabuki_extras::SinkFull<T>> for Error {
+        fn from(_: ::kabuki_extras::SinkFull<T>) -> Self {
             ErrorKind::SinkFull.into()
         }
     }

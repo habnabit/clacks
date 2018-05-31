@@ -55,7 +55,6 @@ pub struct Session {
 enum OutboundMessageWithoutId {
     Plain(mtproto::TLObject),
     Encrypted(mtproto::TLObject),
-    BindPermKey { perm_key: AuthKey, expires_at: i32 },
 }
 
 #[derive(Debug)]
@@ -81,10 +80,6 @@ impl OutboundMessage {
         Self::from_inner(OutboundMessageWithoutId::Encrypted(mtproto::TLObject::new(payload)))
     }
 
-    pub fn bind_temp_auth_key(perm_key: AuthKey, expires_at: i32) -> Self {
-        Self::from_inner(OutboundMessageWithoutId::BindPermKey { perm_key, expires_at })
-    }
-
     pub fn message_id(&self) -> i64 {
         self.message_id
     }
@@ -94,7 +89,6 @@ impl OutboundMessage {
         match self.inner {
             Plain(ref o) |
             Encrypted(ref o) => o.serialize_boxed().0,
-            BindPermKey {..} => unimplemented!(),
         }
     }
 }
@@ -222,12 +216,16 @@ impl Session {
         }
     }
 
-    fn bind_auth_key(&mut self, perm_key: AuthKey, expires_at: i32, message_id: i64) -> Result<Vec<u8>> {
+    pub fn bind_auth_key(&mut self, perm_key: AuthKey, expires_at: i32) -> Result<OutboundMessage> {
         let temp_key = self.fresh_auth_key()?;
+        let message_id = next_message_id();
         let (temp_session_id, bind_message) = perm_key.bind_temp_auth_key(
             &temp_key, expires_at, message_id, &mut CSRNG)?;
         self.temp_session_id = Some(temp_session_id);
-        self.encrypted_payload_inner(mtproto::TLObject::new(bind_message), Some(temp_key), message_id, true)
+        Ok(OutboundMessage {
+            message_id,
+            inner: OutboundMessageWithoutId::Encrypted(mtproto::TLObject::new(bind_message)),
+        })
     }
 
     pub fn serialize_message(&mut self, message: OutboundMessage) -> Result<Vec<u8>> {
@@ -236,7 +234,6 @@ impl Session {
         match inner {
             Plain(p) => self.plain_payload(p, message_id),
             Encrypted(p) => self.encrypted_payload(p, message_id),
-            BindPermKey { perm_key, expires_at } => self.bind_auth_key(perm_key, expires_at, message_id),
         }
     }
 

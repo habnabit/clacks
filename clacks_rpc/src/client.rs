@@ -1,11 +1,12 @@
 use clacks_mtproto::{BoxedDeserialize, ConstructorNumber, mtproto};
 use clacks_transport::{AppId, Session, TelegramCodec, session};
-use futures::{Future, Stream, future};
+use futures::{Future, IntoFuture, Sink, Stream, future};
 use futures::unsync::oneshot;
 use kabuki::{self, Actor, ActorRef, ActorRefOf};
 use kabuki_extras::{
     BoxService, ErasedService, RealShutdownTcpStream, SinkActor, StreamConsumerActorFeeder, StreamEnded};
 use slog::Logger;
+use std::io;
 use std::collections::BTreeMap;
 use tokio_io::{AsyncRead, AsyncWrite, codec};
 use tokio_service::Service;
@@ -23,8 +24,9 @@ pub type EventDelegate = BoxService<Event, (), ()>;
 type Responder = oneshot::Sender<error::Result<mtproto::TLObject>>;
 
 struct RpcClientActor {
-    tg_tx: Option<ActorRef<session::OutboundMessage, (), ::clacks_transport::error::Error>>,
-    sink_error_rx: Option<oneshot::Receiver<::clacks_transport::error::Error>>,
+    session: Session,
+    tg_tx: Option<ActorRef<Vec<u8>, (), error::Error>>,
+    sink_error_rx: Option<oneshot::Receiver<error::Error>>,
     delegate: EventDelegate,
     pending_rpcs: BTreeMap<i64, (ConstructorNumber, Responder)>,
 }
@@ -34,20 +36,20 @@ pub struct RpcClient {
 }
 
 enum InternalEvent {
-    Inbound(session::InboundMessage),
+    Inbound(Vec<u8>),
     Outbound(session::OutboundMessage, Responder),
     ConnectionClosed,
     SetDelegate(EventDelegate),
 }
 
-impl From<session::InboundMessage> for InternalEvent {
-    fn from(m: session::InboundMessage) -> Self {
-        InternalEvent::Inbound(m)
+impl From<Vec<u8>> for InternalEvent {
+    fn from(v: Vec<u8>) -> Self {
+        InternalEvent::Inbound(v)
     }
 }
 
-impl From<StreamEnded<::clacks_transport::error::Error>> for InternalEvent {
-    fn from(e: StreamEnded<::clacks_transport::error::Error>) -> Self {
+impl From<StreamEnded<io::Error>> for InternalEvent {
+    fn from(e: StreamEnded<io::Error>) -> Self {
         InternalEvent::ConnectionClosed
     }
 }
@@ -57,10 +59,11 @@ impl RpcClientActor {
         where E: future::Executor<Box<Future<Item = (), Error = ()>>>,
     {
         let session = Session::new(app_id);
-        let (tg_tx, tg_rx) = stream.framed(TelegramCodec::new(session)).split();
-        let sink = SinkActor::new(log.clone(), tg_tx);
+        let (tg_tx, tg_rx) = stream.framed(TelegramCodec::new()).split();
+        let sink = SinkActor::new(log.clone(), tg_tx.sink_map_err(error::into_error));
         let tg_tx = kabuki::Builder::new().spawn(executor, sink.actor)?;
         let actor = StreamConsumerActorFeeder::new(log, tg_rx, RpcClientActor {
+            session,
             tg_tx: Some(tg_tx),
             sink_error_rx: Some(sink.error_rx),
             delegate: ErasedService::new_erased(kabuki::null()),
@@ -69,8 +72,12 @@ impl RpcClientActor {
         Ok(kabuki::Builder::new().spawn(executor, actor)?)
     }
 
-    fn process_message(&mut self, message: session::InboundMessage) -> <Self as Actor>::Future {
-        let payload =  mtproto::TLObject::boxed_deserialized_from_bytes(&message.payload)
+    fn process_message(&mut self, vec: Vec<u8>) -> <Self as Actor>::Future {
+        let message = match self.session.process_message(&vec) {
+            Ok(m) => m,
+            Err(e) => return Box::new(future::err(e.into())),
+        };
+        let payload = mtproto::TLObject::boxed_deserialized_from_bytes(&message.payload)
             .map_err(error::into_error);
         if message.was_encrypted {
             self.maybe_ack(message.seq_no, message.message_id);
@@ -89,7 +96,7 @@ impl RpcClientActor {
 
     fn maybe_ack(&mut self, seq_no: Option<i32>, message_id: i64) {
         match seq_no {
-            Some(s) if s & 1 != 0 => (),  //self.session.ack_id(message_id),
+            Some(s) if s & 1 != 0 => self.session.ack_id(message_id),
             _ => (),
         }
     }
@@ -113,8 +120,11 @@ impl RpcClientActor {
             },
         }
         Box::new({
-            tg_tx.call(message)
+            self.session.serialize_message(message)
                 .map_err(error::into_error)
+                .map(|v| tg_tx.call(v).map_err(error::into_error))
+                .into_future()
+                .and_then(|f| f)
         })
     }
 
