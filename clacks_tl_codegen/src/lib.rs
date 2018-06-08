@@ -591,6 +591,7 @@ enum WireKind {
     TypeParameter(syn::Ident),
     FlaggedTrue,
     Flags,
+    ExtraDefault(TypeName),
 }
 
 fn is_first_char_lowercase(s: &str) -> bool {
@@ -645,16 +646,18 @@ impl WireKind {
         match *self {
             Bare(..) | Flags => quote!(read_bare),
             Boxed(..) | TypeParameter(..) => quote!(read_boxed),
+            ExtraDefault(..) => quote!(just_default),
             FlaggedTrue => fail_hard(),
         }
     }
 
-    fn as_write_method(&self) -> quote::Tokens {
+    fn as_write_method(&self) -> Option<quote::Tokens> {
         use self::WireKind::*;
         match *self {
-            Bare(..) | Flags => quote!(write_bare),
-            Boxed(..) | TypeParameter(..) => quote!(write_boxed),
-            FlaggedTrue => fail_hard(),
+            Bare(..) | Flags => Some(quote!(write_bare)),
+            Boxed(..) | TypeParameter(..) => Some(quote!(write_boxed)),
+            ExtraDefault(..) => None,
+            FlaggedTrue => Some(fail_hard()),
         }
     }
 
@@ -682,11 +685,20 @@ impl WireKind {
         }
     }
 
+    fn is_extra(&self) -> bool {
+        use self::WireKind::*;
+        match *self {
+            ExtraDefault(..) => true,
+            _ => false,
+        }
+    }
+
     fn opt_names_slice(&self) -> Option<&[syn::Ident]> {
         use self::WireKind::*;
         match *self {
             Bare(ref t) |
-            Boxed(ref t) => t.idents.as_ref().map(|v| v.as_slice()),
+            Boxed(ref t) |
+            ExtraDefault(ref t) => t.idents.as_ref().map(|v| v.as_slice()),
             _ => None,
         }
     }
@@ -792,14 +804,16 @@ impl TypeIR {
         self.assemble_method(self.wire_kind.as_read_method())
     }
 
-    fn as_write_method(&self) -> quote::Tokens {
-        self.assemble_method(self.wire_kind.as_write_method())
+    fn as_write_method(&self) -> Option<quote::Tokens> {
+        self.wire_kind.as_write_method().map(|m| self.assemble_method(m))
     }
 
     fn non_field_type(&self) -> quote::Tokens {
         use self::WireKind::*;
         match self.wire_kind {
-            Bare(ref t) | Boxed(ref t) => t.tokens.clone(),
+            Bare(ref t) |
+            Boxed(ref t) |
+            ExtraDefault(ref t) => t.tokens.clone(),
             TypeParameter(ref t) => quote!(#t),
             _ => fail_hard(),
         }
@@ -878,6 +892,10 @@ impl TypeIR {
         self.wire_kind.is_type_parameter()
     }
 
+    fn is_extra(&self) -> bool {
+        self.wire_kind.is_extra()
+    }
+
     fn owned_names_vec(&self) -> Vec<syn::Ident> {
         self.wire_kind.opt_names_slice()
             .unwrap()
@@ -929,6 +947,19 @@ impl FieldIR {
 
         quote! {
             #name: #ty
+        }
+    }
+
+    fn extra_default(field_name: &str, wire_kind_type: TypeName) -> Self {
+        FieldIR {
+            name: field_name.to_string(),
+            ty: TypeIR {
+                wire_kind: WireKind::ExtraDefault(wire_kind_type),
+                needs_box: false,
+                needs_determiner: false,
+                with_option: false,
+            },
+            flag_bit: None,
         }
     }
 }
@@ -1014,9 +1045,15 @@ impl Constructor<Type, Field> {
             _ => false,
         };
 
-        self.fields.iter()
+        let mut ret: Vec<_> = self.fields.iter()
             .map(|f| f.resolved(resolve_map, replace_string_with_bytes))
-            .collect()
+            .collect();
+        if &self.original_variant == "manual.gzip_packed" {
+            ret.push(FieldIR::extra_default(
+                "unpacked",
+                ["TLObject"].iter().collect::<TypeName>().transformed(|t| quote!(Option<#t>))));
+        }
+        ret
     }
 }
 
@@ -1213,8 +1250,11 @@ impl Constructor<TypeIR, FieldIR> {
         let fields = self.fields.iter()
             .filter(|f| !f.ty.is_flags())
             .map(|f| {
-                let prefix = f.ty.ref_prefix();
                 let field_name = f.name();
+                if f.ty.is_extra() {
+                    return quote! { #field_name: _ }
+                }
+                let prefix = f.ty.ref_prefix();
                 if let Some(local_name) = f.local_name() {
                     quote! { #field_name: #prefix #local_name }
                 } else {
@@ -1234,9 +1274,12 @@ impl Constructor<TypeIR, FieldIR> {
                 if f.ty.is_unit() {
                     return quote!();
                 }
+                let write_method = match f.ty.as_write_method() {
+                    Some(m) => m,
+                    None => return quote!(),
+                };
                 let field_name = f.name();
                 let local_name = f.local_name().unwrap_or_else(|| field_name.clone());
-                let write_method = f.ty.as_write_method();
                 if f.ty.is_flags() {
                     quote! { _ser. #write_method (&_flags)?; }
                 } else if f.flag_bit.is_some() {

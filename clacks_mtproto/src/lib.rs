@@ -56,6 +56,10 @@ impl<'r> Deserializer<'r> {
         let constructor = self.read_constructor()?;
         D::deserialize_boxed(constructor, self)
     }
+
+    pub fn just_default<D: Default>(&self) -> Result<D> {
+        Ok(Default::default())
+    }
 }
 
 impl<'r> io::Read for Deserializer<'r> {
