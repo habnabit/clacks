@@ -9,6 +9,8 @@ use std::fmt;
 use std::io::{Read, Write};
 use std::marker::PhantomData;
 
+use mtproto::manual::GzipPacked;
+
 const MAX_BYTES_DEBUG_LEN: usize = 4;
 
 macro_rules! impl_byteslike {
@@ -112,11 +114,28 @@ impl TLObject {
         TLObject(Box::new(inner))
     }
 
+    pub fn is<I: AnyBoxedSerialize>(&self) -> bool {
+        self.0.as_any().is::<I>()
+    }
+
     pub fn downcast<I: AnyBoxedSerialize>(self) -> ::std::result::Result<I, Self> {
-        if self.0.as_any().is::<I>() {
+        if self.is::<I>() {
             Ok(*self.0.into_boxed_any().downcast::<I>().unwrap())
         } else {
-            Err(self)
+            let is_gunzip = match self.0.as_any().downcast_ref::<TransparentGunzip>() {
+                Some(gz) => gz.inner.is::<I>(),
+                _ => false,
+            };
+            if is_gunzip {
+                Ok(*{
+                    self.0.into_boxed_any()
+                        .downcast::<TransparentGunzip>().unwrap()
+                        .inner.0.into_boxed_any()
+                        .downcast::<I>().unwrap()
+                })
+            } else {
+                Err(self)
+            }
         }
     }
 }
@@ -158,6 +177,46 @@ impl serde::Serialize for TLObject {
         where S: serde::Serializer,
     {
         serde::Serialize::serialize(&self.0, serializer)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TransparentGunzip {
+    pub inner: TLObject,
+    pub original: GzipPacked,
+}
+
+impl BoxedDeserialize for TransparentGunzip {
+    fn possible_constructors() -> Vec<ConstructorNumber> {
+        GzipPacked::possible_constructors()
+    }
+
+    fn deserialize_boxed(id: ConstructorNumber, de: &mut Deserializer) -> Result<Self> {
+        use flate2::bufread::GzDecoder;
+        use std::io::Read;
+
+        let original = GzipPacked::deserialize_boxed(id, de)?;
+        let inner = {
+            let mut data: &[u8] = original.packed_data();
+            let mut decompressed = vec![];
+            GzDecoder::new(&mut data).read_to_end(&mut decompressed)?;
+            TLObject::boxed_deserialized_from_bytes(&decompressed)?
+        };
+        Ok(TransparentGunzip { inner, original })
+    }
+}
+
+impl BoxedSerialize for TransparentGunzip {
+    fn serialize_boxed<'this>(&'this self) -> (ConstructorNumber, &'this BareSerialize) {
+        self.inner.serialize_boxed()
+    }
+}
+
+impl serde::Serialize for TransparentGunzip {
+    fn serialize<S>(&self, serializer: S) -> ::std::result::Result<S::Ok, S::Error>
+        where S: serde::Serializer,
+    {
+        serde::Serialize::serialize(&self.inner, serializer)
     }
 }
 
@@ -208,24 +267,44 @@ impl BareSerialize for () {
     }
 }
 
+use mtproto::Bool;
+
+impl From<bool> for &'static Bool {
+    fn from(b: bool) -> Self {
+        if b { &Bool::True } else { &Bool::False }
+    }
+}
+
+impl From<bool> for Bool {
+    fn from(b: bool) -> Self {
+        let b: &'static Bool = b.into();
+        b.clone()
+    }
+}
+
+impl Into<bool> for Bool {
+    fn into(self) -> bool {
+        match self {
+            Bool::True => true,
+            Bool::False => false,
+        }
+    }
+}
+
 impl BoxedDeserialize for bool {
     fn possible_constructors() -> Vec<ConstructorNumber> {
-        ::mtproto::Bool::possible_constructors()
+        Bool::possible_constructors()
     }
 
     fn deserialize_boxed(id: ConstructorNumber, de: &mut Deserializer) -> Result<Self> {
-        use mtproto::Bool;
-        Ok(match Bool::deserialize_boxed(id, de)? {
-            Bool::True => true,
-            Bool::False => false,
-        })
+        Ok(Bool::deserialize_boxed(id, de)?.into())
     }
 }
 
 impl BoxedSerialize for bool {
     fn serialize_boxed<'this>(&'this self) -> (ConstructorNumber, &'this BareSerialize) {
-        use mtproto::Bool;
-        Bool::serialize_boxed(if *self { &Bool::True } else { &Bool::False })
+        let b: &'static Bool = (*self).into();
+        Bool::serialize_boxed(b)
     }
 }
 
@@ -281,7 +360,9 @@ impl<Det, T> fmt::Debug for Vector<Det, T>
     where T: fmt::Debug,
 {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "Vector({:?})", self.0)
+        f.debug_tuple("Vector")
+            .field(&self.0)
+            .finish()
     }
 }
 

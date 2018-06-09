@@ -7,6 +7,7 @@
 #[macro_use] extern crate serde_derive;
 extern crate byteorder;
 extern crate extfmt;
+extern crate flate2;
 extern crate rand;
 extern crate serde;
 

@@ -1618,7 +1618,11 @@ impl Constructors<TypeIR, FieldIR> {
     fn as_dynamic_deserializer(&self) -> quote::Tokens {
         let constructors = self.constructors_and_tl_ids()
             .map(|(tl_id, c)| {
-                let ty = c.output.unboxed();
+                let ty = if &c.original_variant == "manual.gzip_packed" {
+                    quote!(::mtproto::TransparentGunzip)
+                } else {
+                    c.output.unboxed()
+                };
                 quote!(ret.insert(#tl_id, <#ty as ::BoxedDeserializeDynamic>::boxed_deserialize_to_box as ::DynamicDeserializer))
             });
         quote! {

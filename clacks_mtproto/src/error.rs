@@ -1,3 +1,5 @@
+#![allow(renamed_and_removed_lints)]
+
 error_chain! {
     foreign_links {
         Io(::std::io::Error);
