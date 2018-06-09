@@ -2,18 +2,21 @@
 #![recursion_limit = "128"]
 
 #[macro_use] extern crate error_chain;
+#[macro_use] extern crate kabuki_extras;
 #[macro_use] extern crate slog;
 extern crate byteorder;
 extern crate bytes;
 extern crate chrono;
 extern crate clacks_crypto;
 extern crate clacks_mtproto;
+extern crate either;
 extern crate futures;
 extern crate kabuki;
-extern crate kabuki_extras;
 extern crate rand;
+extern crate serde_json;
 extern crate tokio_io;
 
+#[allow(renamed_and_removed_lints)]
 pub mod error {
     error_chain! {
         links {
@@ -47,6 +50,8 @@ pub mod error {
         }
     }
 
+    error_chain_extras!(Error, ErrorKind::Msg);
+
     impl From<::futures::Canceled> for Error {
         fn from(_: ::futures::Canceled) -> Self {
             ErrorKind::Canceled.into()
@@ -62,12 +67,6 @@ pub mod error {
     impl From<::kabuki_extras::SinkErrored<Self>> for Error {
         fn from(e: ::kabuki_extras::SinkErrored<Self>) -> Self {
             Self::with_chain(e.0, ErrorKind::SinkErrored)
-        }
-    }
-
-    impl From<::kabuki_extras::SinkFull<::session::OutboundMessage>> for Error {
-        fn from(_: ::kabuki_extras::SinkFull<::session::OutboundMessage>) -> Self {
-            ErrorKind::SinkFull.into()
         }
     }
 

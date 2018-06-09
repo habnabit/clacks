@@ -1,18 +1,28 @@
+#![cfg_attr(feature = "kex", feature(proc_macro, proc_macro_non_items, generators))]
 #![deny(private_in_public, unused_extern_crates)]
 #![recursion_limit = "128"]
 
 #[macro_use] extern crate error_chain;
 #[macro_use] extern crate kabuki_extras;
 #[macro_use] extern crate slog;
+extern crate byteorder;
+extern crate chrono;
 extern crate clacks_crypto;
 extern crate clacks_mtproto;
 extern crate clacks_transport;
-extern crate flate2;
-extern crate futures;
+extern crate futures_cpupool;
 extern crate kabuki;
 extern crate tokio_io;
 extern crate tokio_service;
 
+
+#[cfg(not(feature = "kex"))]
+extern crate futures;
+#[cfg(feature = "kex")]
+extern crate futures_await as futures;
+
+
+#[allow(renamed_and_removed_lints)]
 pub mod error {
     error_chain! {
         links {
@@ -85,3 +95,5 @@ pub mod error {
 }
 
 pub mod client;
+#[cfg(feature = "kex")]
+pub mod kex;

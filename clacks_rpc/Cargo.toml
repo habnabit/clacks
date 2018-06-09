@@ -12,10 +12,16 @@ chrono = "0.4"
 error-chain = "0.11"
 flate2 = "*"
 futures = "0.1"
+futures-cpupool = "*"
 rand = "0.4"
 slog = "*"
 tokio-io = "0.1"
 tokio-service = "*"
+tokio-timer = "*"
+
+[dependencies.futures-await]
+version = "*"
+optional = true
 
 [dependencies.clacks_mtproto]
 path = "../clacks_mtproto"
@@ -34,3 +40,7 @@ path = "../kabuki"
 
 [dependencies.kabuki_extras]
 path = "../kabuki_extras"
+
+[features]
+default = ["kex"]
+kex = ["futures-await"]

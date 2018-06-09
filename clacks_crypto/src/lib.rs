@@ -3,10 +3,12 @@
 
 #[macro_use] extern crate error_chain;
 extern crate byteorder;
+extern crate chrono;
 extern crate clacks_mtproto;
 extern crate openssl;
 extern crate rand;
 
+#[allow(renamed_and_removed_lints)]
 pub mod error {
     error_chain! {
         links {
@@ -44,7 +46,7 @@ enum Padding {
     Mod16,
 }
 
-fn sha1_bytes(parts: &[&[u8]]) -> ::error::Result<::openssl::hash::DigestBytes> {
+pub fn sha1_bytes(parts: &[&[u8]]) -> ::error::Result<::openssl::hash::DigestBytes> {
     let mut hasher = ::openssl::hash::Hasher::new(::openssl::hash::MessageDigest::sha1())?;
     for part in parts {
         hasher.update(part)?;

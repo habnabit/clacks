@@ -1,22 +1,26 @@
+use chrono::{Duration, Utc};
+use clacks_crypto::symm::AuthKey;
 use clacks_mtproto::{BoxedDeserialize, ConstructorNumber, mtproto};
 use clacks_transport::{AppId, Session, TelegramCodec, session};
-use futures::{Future, IntoFuture, Sink, Stream, future};
+use futures::{Future, IntoFuture, Sink, Stream, future, stream};
 use futures::unsync::oneshot;
 use kabuki::{self, Actor, ActorRef, ActorRefOf};
 use kabuki_extras::{
-    BoxService, ErasedService, RealShutdownTcpStream, SinkActor, StreamConsumerActorFeeder, StreamEnded};
+    BoxService, ErasedService, SinkActor, StreamConsumerActorFeeder, StreamEnded};
+use kabuki_extras::ext_traits::*;
 use slog::Logger;
 use std::io;
 use std::collections::BTreeMap;
-use tokio_io::{AsyncRead, AsyncWrite, codec};
+use tokio_io::{AsyncRead, AsyncWrite};
 use tokio_service::Service;
 
-use error::{self, BoxFuture, FutureExtInto, FutureExtUnit, Result};
+use error::{self, BoxFuture, FutureExtUnit, LocalFuture, Result};
 
 
 #[derive(Debug)]
 pub enum Event {
     Updates(mtproto::Updates),
+    Unhandled(mtproto::TLObject),
     ConnectionClosing,
 }
 
@@ -31,15 +35,22 @@ struct RpcClientActor {
     pending_rpcs: BTreeMap<i64, (ConstructorNumber, Responder)>,
 }
 
+#[derive(Clone)]
 pub struct RpcClient {
     actor_tx: ActorRefOf<RpcClientActor>,
 }
 
-enum InternalEvent {
+pub(crate) enum InternalEvent {
     Inbound(Vec<u8>),
-    Outbound(session::OutboundMessage, Responder),
+    Outbound(session::EitherMessageBuilder, Responder),
     ConnectionClosed,
     SetDelegate(EventDelegate),
+    BindAuthKey {
+        perm_key: AuthKey,
+        temp_key: AuthKey,
+        temp_key_duration: Duration,
+        salt: mtproto::FutureSalt,
+    },
 }
 
 impl From<Vec<u8>> for InternalEvent {
@@ -55,8 +66,9 @@ impl From<StreamEnded<io::Error>> for InternalEvent {
 }
 
 impl RpcClientActor {
-    fn spawn<E>(executor: &E, log: Logger, app_id: AppId, stream: RealShutdownTcpStream) -> Result<ActorRefOf<RpcClientActor>>
+    fn spawn<E, S>(executor: &E, log: Logger, app_id: AppId, stream: S) -> Result<ActorRefOf<RpcClientActor>>
         where E: future::Executor<Box<Future<Item = (), Error = ()>>>,
+              S: AsyncRead + AsyncWrite + 'static,
     {
         let session = Session::new(app_id);
         let (tg_tx, tg_rx) = stream.framed(TelegramCodec::new()).split();
@@ -81,9 +93,10 @@ impl RpcClientActor {
             .map_err(error::into_error);
         if message.was_encrypted {
             self.maybe_ack(message.seq_no, message.message_id);
-            return Box::new(future::result({
-                payload.and_then(|o| self.scan_replies(o))
-            }));
+            return Box::new({
+                future::result(payload.map(|o| self.scan_replies(o)))
+                    .and_then(|f| f)
+            });
         } else if self.pending_rpcs.len() != 1 {
             // XXX: can't dispatch this message
         } else {
@@ -101,7 +114,7 @@ impl RpcClientActor {
         }
     }
 
-    fn send_message(&mut self, message: session::OutboundMessage, responder: Responder) -> <Self as Actor>::Future {
+    fn send_message(&mut self, message: session::EitherMessageBuilder, responder: Responder) -> <Self as Actor>::Future {
         use std::collections::btree_map::Entry::*;
         let tg_tx = match self.tg_tx {
             Some(ref c) => c,
@@ -134,6 +147,25 @@ impl RpcClientActor {
         self.delegate.call(Event::ConnectionClosing)
     }
 
+    fn bind_auth_key(&mut self, perm_key: AuthKey, temp_key: AuthKey, temp_key_duration: Duration, salt: mtproto::FutureSalt) -> <Self as Actor>::Future {
+        self.session.adopt_key(temp_key);
+        self.session.add_server_salts(::std::iter::once(salt));
+        let (tx, rx) = oneshot::channel();
+        let bound = self.session.bind_auth_key(perm_key, temp_key_duration)
+            .map(|message| self.send_message(message.lift(), tx));
+        Box::new({
+            future::result(bound)
+                .map_err(error::into_error)
+                .and_then(|f| rx.map_err(error::into_error).join(f))
+                .and_then(|(r, ())| r)
+                .and_then(|o| match AuthKey::downcast_bind_temp_auth_key(o) {
+                    Ok(true) => Ok(()),
+                    Ok(false) => unimplemented!(),
+                    Err(e) => Err(error::ErrorKind::WrongReplyType(e).into())
+                })
+        })
+    }
+
     fn process_sync(&mut self, req: InternalEvent) -> <Self as Actor>::Future {
         use self::InternalEvent::*;
         match req {
@@ -147,6 +179,8 @@ impl RpcClientActor {
                 self.close_connection()
                     .map_unit_err("closing connection")
             }),
+            BindAuthKey { perm_key, temp_key, temp_key_duration, salt } =>
+                self.bind_auth_key(perm_key, temp_key, temp_key_duration, salt),
         }
     }
 }
@@ -154,11 +188,21 @@ impl RpcClientActor {
 struct Scan<'a, S>(&'a mut RpcClientActor, S);
 
 macro_rules! scan_type_impl {
-    (@block_phase(($this:ident, $name:ident: $ty:ty) $block:block $($rin:tt)*) $($rout:tt)*) => {
+    (@block_phase(($this:ident, $name:ident: $ty:ty) -> Future $block:block $($rin:tt)*) $($rout:tt)*) => {
         impl<'a> Scan<'a, $ty> {
-            fn scan(self) -> Result<()> {
+            fn scan(self) -> BoxFuture<()> {
                 let Scan($this, $name) = self;
-                $block
+                Box::new($block)
+            }
+        }
+
+        scan_type_impl! { @block_phase($($rin)*) @out($ty) $($rout)* }
+    };
+    (@block_phase(($this:ident, $name:ident: $ty:ty) -> Result $block:block $($rin:tt)*) $($rout:tt)*) => {
+        impl<'a> Scan<'a, $ty> {
+            fn scan(self) -> BoxFuture<()> {
+                let Scan($this, $name) = self;
+                Box::new(future::result((|| $block)()))
             }
         }
 
@@ -167,7 +211,7 @@ macro_rules! scan_type_impl {
 
     (@block_phase() $($rest:tt)*) => {
         impl RpcClientActor {
-            fn scan_replies(&mut self, mut obj: mtproto::TLObject) -> Result<()> {
+            fn scan_replies(&mut self, mut obj: mtproto::TLObject) -> BoxFuture<()> {
                 scan_type_impl! { @obj(self, obj) $($rest)* }
             }
         }
@@ -182,8 +226,8 @@ macro_rules! scan_type_impl {
     };
 
     (@obj($self:ident, $obj:ident)) => {
-        println!("unknown thing to scan {:?}", $obj);
-        Ok(())
+        $self.delegate.call(Event::Unhandled($obj))
+            .map_unit_err("sending Unhandled to the delegate")
     };
 }
 
@@ -194,27 +238,17 @@ macro_rules! scan_type {
 }
 
 scan_type! {
-    (this, gz: mtproto::manual::GzipPacked) {
-        use flate2::bufread::GzDecoder;
-        use std::io::Read;
-
-        let mut bytes: &[u8] = gz.packed_data();
-        let mut decompressed = vec![];
-        GzDecoder::new(&mut bytes).read_to_end(&mut decompressed)?;
-        let obj = mtproto::TLObject::boxed_deserialized_from_bytes(&decompressed)?;
-        this.scan_replies(obj)
-    }
-
-    (this, mc: mtproto::manual::MessageContainer) {
+    (this, mc: mtproto::manual::MessageContainer) -> Future {
         let mtproto::manual::MessageContainer::MsgContainer(mc) = mc;
+        let mut ret = stream::FuturesUnordered::new();
         for msg in mc.messages.0 {
             this.maybe_ack(Some(msg.seqno), msg.msg_id);
-            this.scan_replies(msg.body.0)?;
+            ret.push(this.scan_replies(msg.body.0));
         }
-        Ok(())
+        ret.for_each(|()| Ok(()))
     }
 
-    (this, rpc: mtproto::manual::RpcResult) {
+    (this, rpc: mtproto::manual::RpcResult) -> Result {
         let mtproto::manual::RpcResult::RpcResult(rpc) = rpc;
         let (_, replier) = match this.pending_rpcs.remove(&rpc.req_msg_id) {
             Some(t) => t,
@@ -236,39 +270,55 @@ impl Actor for RpcClientActor {
     type Request = InternalEvent;
     type Response = ();
     type Error = error::Error;
-    type Future = Box<Future<Item = (), Error = error::Error>>;
+    type Future = BoxFuture<()>;
 
     fn call(&mut self, req: Self::Request) -> Self::Future {
         self.process_sync(req)
     }
 }
 
+fn one_cpupool() -> ::futures_cpupool::CpuPool {
+    ::futures_cpupool::Builder::new()
+        .pool_size(1)
+        .create()
+}
+
 impl RpcClient {
-    pub fn spawn<E>(executor: &E, log: Logger, app_id: AppId, stream: RealShutdownTcpStream) -> Result<Self>
+    pub fn spawn<E, S>(executor: &E, log: Logger, app_id: AppId, stream: S) -> Result<Self>
         where E: future::Executor<Box<Future<Item = (), Error = ()>>>,
+              S: AsyncRead + AsyncWrite + 'static,
     {
         RpcClientActor::spawn(executor, log, app_id, stream)
             .map(|actor_tx| RpcClient { actor_tx })
     }
 
-    pub fn ask<M: ::clacks_mtproto::Function>(&self, query: M) -> BoxFuture<M::Reply> {
-        self.ask_inner::<M>(session::OutboundMessage::encrypted(query))
+    pub fn ask<M: ::clacks_mtproto::Function>(&self, query: M) -> impl LocalFuture<M::Reply> {
+        self.ask_inner::<M>(session::EitherMessageBuilder::encrypted(query))
     }
 
-    pub fn ask_plain<M: ::clacks_mtproto::Function>(&self, query: M) -> BoxFuture<M::Reply> {
-        self.ask_inner::<M>(session::OutboundMessage::plain(query))
+    pub(crate) fn ask_plain<M: ::clacks_mtproto::Function>(&self, query: M) -> impl LocalFuture<M::Reply> {
+        self.ask_inner::<M>(session::EitherMessageBuilder::plain(query))
     }
 
-    fn ask_inner<M: ::clacks_mtproto::Function>(&self, query: session::OutboundMessage) -> BoxFuture<M::Reply> {
-        let (tx, rx) = oneshot::channel();
-        Box::new({
-            self.actor_tx.call(InternalEvent::Outbound(query, tx))
-                .and_then(move |()| rx.map_err(error::into_error))
+    fn ask_inner<M: ::clacks_mtproto::Function>(&self, query: session::EitherMessageBuilder) -> impl LocalFuture<M::Reply> {
+        self.actor_tx.ask(InternalEvent::Outbound, query)
                 .and_then(|r| r)
                 .and_then(|obj| match obj.downcast::<M::Reply>() {
                     Ok(r) => Ok(r),
                     Err(b) => Err(error::ErrorKind::WrongReplyType(b).into()),
                 })
-        })
+    }
+
+    pub fn set_delegate(&self, delegate: EventDelegate) -> impl LocalFuture<()> {
+        self.actor_tx.call(InternalEvent::SetDelegate(delegate))
+    }
+
+    pub fn new_auth_key(&self, temp_key_duration: Duration) -> impl LocalFuture<AuthKey> {
+        ::kex::kex(self.clone(), one_cpupool(), None)
+            .map(|(k, _)| k)
+    }
+
+    pub(crate) fn call(&self, req: InternalEvent) -> impl LocalFuture<()> {
+        self.actor_tx.call(req)
     }
 }

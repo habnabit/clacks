@@ -7,6 +7,7 @@ description = "crypto-related functionality for telegram/mtproto"
 
 [dependencies]
 byteorder = "1.2"
+chrono = "*"
 error-chain = "0.11"
 openssl = "0.10"
 rand = "0.4"

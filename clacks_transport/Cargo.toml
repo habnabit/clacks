@@ -9,12 +9,15 @@ description = "telegram's TCP transport encoding"
 byteorder = "1.2"
 bytes = "0.4"
 chrono = "0.4"
+either = "*"
 error-chain = "0.11"
 futures = "0.1"
 rand = "0.4"
 slog = "*"
 tokio-io = "0.1"
 tokio-service = "*"
+
+serde_json = "*"
 
 [dependencies.clacks_mtproto]
 path = "../clacks_mtproto"

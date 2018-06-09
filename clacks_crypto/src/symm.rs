@@ -1,14 +1,14 @@
 use byteorder::{LittleEndian, ByteOrder, WriteBytesExt};
-use clacks_mtproto::{BareSerialize, IntoBoxed, mtproto};
+use chrono::Duration;
+use clacks_mtproto::{BareSerialize, Function, IntoBoxed, mtproto};
 use clacks_mtproto::mtproto::wire::inbound_encrypted::InboundEncrypted;
 use clacks_mtproto::mtproto::wire::outbound_encrypted::OutboundEncrypted;
 use openssl::{aes, symm};
-use rand::Rng;
 use std::fmt;
 use std::io::{Cursor, Write};
 
 use error::{ErrorKind, Result};
-use {Padding, sha1_and_or_pad, sha1_bytes};
+use {Padding, csrng_gen, sha1_and_or_pad, sha1_bytes};
 
 #[derive(Default, Clone, Copy)]
 pub struct AesParams {
@@ -185,21 +185,30 @@ impl AuthKey {
         self.auth_key
     }
 
-    pub fn bind_temp_auth_key<R: Rng>(self, temp_key: &AuthKey, expires_at: i32, message_id: i64, rng: &mut R)
-                                      -> Result<(i64, mtproto::rpc::auth::BindTempAuthKey)> {
-        let nonce: i64 = rng.gen();
-        let temp_session_id: i64 = rng.gen();
+    pub fn downcast_bind_temp_auth_key(obj: mtproto::TLObject) -> ::std::result::Result<bool, mtproto::TLObject> {
+        obj.downcast::<<mtproto::rpc::auth::BindTempAuthKey as Function>::Reply>()
+            .map(Into::into)
+    }
+
+    pub fn bind_temp_auth_key(self, temp_key: &AuthKey, expires_in: Duration, message_id: i64)
+                             -> Result<(i64, mtproto::rpc::auth::BindTempAuthKey)>
+    {
+        let expires_in = expires_in.num_seconds();
+        assert!(expires_in < ::std::i32::MAX as i64);
+        let expires_at = expires_in as i32;
+        let nonce: i64 = csrng_gen();
+        let temp_session_id: i64 = csrng_gen();
+        let inner = mtproto::manual::bind_auth_key_inner::BindAuthKeyInner {
+            nonce, expires_at, temp_session_id,
+            temp_auth_key_id: temp_key.fingerprint,
+            perm_auth_key_id: self.fingerprint,
+        }.into_boxed();
         let inner = OutboundEncrypted {
             message_id,
-            salt: rng.gen(),
-            session_id: rng.gen(),
+            salt: csrng_gen(),
+            session_id: csrng_gen(),
             seq_no: 0,
-            payload: (mtproto::TLObject::new(mtproto::manual::bind_auth_key_inner::BindAuthKeyInner {
-                nonce, expires_at,
-                temp_auth_key_id: temp_key.fingerprint,
-                perm_auth_key_id: self.fingerprint,
-                temp_session_id: temp_session_id,
-            }.into_boxed())).into(),
+            payload: (mtproto::TLObject::new(inner)).into(),
         };
         Ok((temp_session_id, mtproto::rpc::auth::BindTempAuthKey {
             nonce, expires_at,
