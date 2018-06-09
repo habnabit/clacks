@@ -12,6 +12,7 @@ smallvec = "*"
 tokio-io = "*"
 tokio-service = "*"
 tokio-tcp = "*"
+tokio-uds = "*"
 void = "*"
 
 [dependencies.kabuki]

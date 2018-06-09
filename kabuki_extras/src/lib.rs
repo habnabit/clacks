@@ -10,7 +10,10 @@ extern crate smallvec;
 extern crate tokio_service;
 extern crate tokio_io;
 extern crate tokio_tcp;
+extern crate tokio_uds;
 extern crate void;
+
+pub mod ext_traits;
 
 mod scrundle;
 pub use scrundle::*;
@@ -18,11 +21,12 @@ pub use scrundle::*;
 mod service;
 pub use service::*;
 
+mod sockets;
+pub use sockets::*;
+
 mod streams;
 pub use streams::*;
 
-mod tcp;
-pub use tcp::*;
 
 #[macro_export]
 macro_rules! error_chain_extras {
@@ -39,6 +43,11 @@ macro_rules! error_chain_extras {
         {
             e.into()
         }
+
+        pub trait LocalFuture<T>: Future<Item = T, Error = $Error> {}
+        impl<T, F> LocalFuture<T> for F
+            where F: Future<Item = T, Error = $Error>,
+        {}
 
         pub trait FutureExtInto: Future {
             fn map_err_into<E>(self) -> BoxFuture<Self::Item>
