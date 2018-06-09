@@ -1,5 +1,5 @@
 #![warn(unused_extern_crates)]
-#![feature(proc_macro, generators)]
+#![feature(proc_macro, proc_macro_non_items, generators)]
 
 #[macro_use] extern crate slog;
 
@@ -10,6 +10,8 @@ extern crate clacks_mtproto;
 extern crate clacks_rpc;
 extern crate clacks_transport;
 extern crate futures_await as futures;
+extern crate futures_cpupool;
+extern crate kabuki;
 extern crate kabuki_extras;
 extern crate rand;
 extern crate serde;
@@ -47,6 +49,18 @@ macro_rules! enquote_integer {
 }
 
 impl sexpr::ser::Formatter for ElispFormatter {
+    fn write_null<W: ?Sized>(&mut self, writer: &mut W) -> io::Result<()>
+        where W: io::Write,
+    {
+        writer.write_all(b"nil")
+    }
+
+    fn write_bool<W: ?Sized>(&mut self, writer: &mut W, value: bool) -> io::Result<()>
+        where W: io::Write,
+    {
+        writer.write_all(if value {b"t"} else {b"nil"})
+    }
+
     enquote_integer!(u32, write_u32);
     enquote_integer!(i32, write_i32);
     enquote_integer!(u64, write_u64);
@@ -94,87 +108,43 @@ impl ElispFormatter {
     }
 }
 
-fn into_error<T>(x: T) -> clacks_transport::error::Error
-    where T: Into<clacks_transport::error::Error>
-{
-    x.into()
+
+struct Delegate;
+
+impl kabuki::Actor for Delegate {
+    type Request = clacks_rpc::client::Event;
+    type Response = ();
+    type Error = ();
+    type Future = Box<Future<Item = (), Error = ()>>;
+
+    fn call(&mut self, request: Self::Request) -> Self::Future {
+        use clacks_rpc::client::Event::*;
+        println!("event {:?}", request);
+        match request {
+            Unhandled(o) => {
+                println!("---sexpr---\n{}\n", ElispFormatter::to_string(&o).expect("not serialized"));
+                println!("---json---\n{}\n---", serde_json::to_string_pretty(&o).expect("not serialized"));
+            },
+            _ => (),
+        }
+        Box::new(future::ok(()))
+    }
 }
 
-fn u32_bytes(n: u32) -> mtproto::bytes {
-    let mut ret = vec![0u8; 4];
-    BigEndian::write_u32(&mut ret, n);
-    ret.into()
-}
-
-#[async]
-fn kex(log: slog::Logger) -> clacks_rpc::error::Result<()> {
+fn kex(log: slog::Logger) -> impl clacks_rpc::error::LocalFuture<()> { async_block! {
     let executor = tokio::executor::current_thread::TaskExecutor::current();
-    let socket: kabuki_extras::RealShutdownTcpStream = await!(
+    let socket: kabuki_extras::RealShutdown<tokio::net::TcpStream> = await!(
         tokio::net::TcpStream::connect(&"149.154.167.50:443".parse().unwrap()))?.into();
     let app_id = clacks_transport::session::AppId {
         api_id: 0,
         api_hash: "".into(),
     };
     let client = clacks_rpc::client::RpcClient::spawn(&executor, log, app_id, socket)?;
-    let nonce = csrng_gen();
-    let mtproto::ResPQ::ResPQ(pq) = await!(client.ask_plain(mtproto::rpc::ReqPq { nonce }))?;
-    println!("got back: {:#?}", pq);
-    assert_eq!(nonce, pq.nonce);
-    let server_nonce = pq.server_nonce;
-    let pq_int = byteorder::BigEndian::read_u64(&pq.pq);
-    let (p, q) = clacks_crypto::asymm::decompose_pq(pq_int)?;
-    let (pubkey, public_key_fingerprint) = clacks_crypto::asymm::find_first_key(&pq.server_public_key_fingerprints)?.unwrap();
-    let new_nonce = csrng_gen();
-    let inner = mtproto::p_q_inner_data::PQInnerData {
-        nonce, new_nonce, server_nonce,
-        p: u32_bytes(p), q: u32_bytes(q),
-        pq: pq.pq,
-    }.into_boxed();
-    let aes = clacks_crypto::symm::AesParams::from_pq_inner_data(&inner)?;
-    println!("inner: {:#?}", inner);
-    let encrypted_data = pubkey.encrypt(&inner.boxed_serialized_bytes()?)?.into();
-    let dh_req = mtproto::rpc::ReqDHParams {
-        nonce, server_nonce, public_key_fingerprint, encrypted_data,
-        p: u32_bytes(p), q: u32_bytes(q),
-    };
-    println!("dh_req: {:#?}", dh_req);
-    let dh_params = await!(client.ask_plain(dh_req))?;
-    println!("got back: {:#?}", dh_params);
-    let dh_params = match dh_params {
-        mtproto::ServerDHParams::Ok(x) => x,
-        _ => unimplemented!(),
-    };
-    let decrypted = aes.ige_decrypt(&dh_params.encrypted_answer)?;
-    let server_dh_data = {
-        let (sha_part, data_part) = decrypted.split_at(20);
-        mtproto::ServerDHInnerData::boxed_deserialized_from_bytes(&data_part)?
-    };
-    println!("dh data: {:#?}", server_dh_data);
-    let (auth_key, g_b) = clacks_crypto::asymm::calculate_auth_key(&server_dh_data)?;
-    let inner = mtproto::client_dh_inner_data::ClientDHInnerData {
-        nonce, server_nonce, g_b,
-        retry_id: 0,
-    }.into_boxed();
-    println!("inner: {:#?}", inner);
-    let encrypted_data = aes.ige_encrypt(&inner.boxed_serialized_bytes()?, true)?.into();
-    let set_dh = mtproto::rpc::SetClientDHParams {
-        nonce, server_nonce, encrypted_data,
-    };
-    println!("set_dh: {:#?}", set_dh);
-    let answer = await!(client.ask_plain(set_dh))?;
-    println!("answer: {:#?}", answer);
-    let expected_new_nonce_hash1 = auth_key.new_nonce_hash(1, new_nonce)?;
-    match answer {
-        mtproto::SetClientDHParamsAnswer::Ok(ref n) if n.new_nonce_hash1 == expected_new_nonce_hash1 => (),
-        _ => unimplemented!(),
-    }
-    let mut new_salt = [0u8; 8];
-    for ((loc, &a), &b) in new_salt.iter_mut().zip(&new_nonce[..8]).zip(&server_nonce[..8]) {
-        *loc = a ^ b;
-    }
-    println!("results: {:?} {:?}", auth_key, new_salt);
-    let now = chrono::Utc::now();
-    let salt = clacks_transport::session::future_salt_from_negotiated_salt(LittleEndian::read_i64(&new_salt));
+    let delegate = kabuki::Builder::new().spawn(&executor, Delegate)?;
+    let () = await!(client.set_delegate(kabuki_extras::ErasedService::new_erased(delegate)))?;
+    let perm_key = await!(clacks_rpc::kex::new_auth_key(
+        client.clone(), futures_cpupool::CpuPool::new(1), chrono::Duration::hours(24)))?;
+    println!("perm_key: {:?}", perm_key);
     let init = mtproto::rpc::InvokeWithLayer {
         layer: mtproto::LAYER,
         query: mtproto::rpc::InitConnection {
@@ -195,10 +165,12 @@ fn kex(log: slog::Logger) -> clacks_rpc::error::Result<()> {
         api_id: 0,
         api_hash: "".to_string(),
     };
-    let answer = await!(client.ask(send_code))?;
+    let answer = await!(client.ask(init))?;
     println!("answer: {:#?}", answer);
+    println!("---sexpr---\n{}\n", ElispFormatter::to_string(&answer).expect("not serialized"));
+    println!("---json---\n{}\n---", serde_json::to_string_pretty(&answer).expect("not serialized"));
     Ok(())
-}
+}}
 
 fn main() {
     use futures::{Future, Stream};
