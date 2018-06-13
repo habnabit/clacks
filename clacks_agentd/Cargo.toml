@@ -6,7 +6,7 @@ authors = ["Aaron Gallagher <_@habnab.it>"]
 [dependencies]
 byteorder = "*"
 chrono = "*"
-error-chain = "*"
+failure = "0.1.1"
 futures = "0.1"
 futures-await = "*"
 futures-cpupool = "*"

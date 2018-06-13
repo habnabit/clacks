@@ -9,6 +9,7 @@ extern crate clacks_crypto;
 extern crate clacks_mtproto;
 extern crate clacks_rpc;
 extern crate clacks_transport;
+extern crate failure;
 extern crate futures_await as futures;
 extern crate futures_cpupool;
 extern crate kabuki;
@@ -29,6 +30,7 @@ use clacks_crypto::csrng_gen;
 use clacks_mtproto::{BoxedDeserialize, BoxedSerialize, IntoBoxed, mtproto};
 use futures::{Future, Sink, Stream, future};
 use futures::prelude::*;
+use kabuki_extras::ext_traits::*;
 use rand::Rng;
 use std::io;
 use tokio_io::{AsyncRead, AsyncWrite};
@@ -114,8 +116,7 @@ struct Delegate;
 impl kabuki::Actor for Delegate {
     type Request = clacks_rpc::client::Event;
     type Response = ();
-    type Error = ();
-    type Future = Box<Future<Item = (), Error = ()>>;
+    type Future = BoxFuture<()>;
 
     fn call(&mut self, request: Self::Request) -> Self::Future {
         use clacks_rpc::client::Event::*;
@@ -131,7 +132,7 @@ impl kabuki::Actor for Delegate {
     }
 }
 
-fn kex(log: slog::Logger) -> impl clacks_rpc::error::LocalFuture<()> { async_block! {
+fn kex(log: slog::Logger) -> impl FailureFuture<()> { async_block! {
     let executor = tokio::executor::current_thread::TaskExecutor::current();
     let socket: kabuki_extras::RealShutdown<tokio::net::TcpStream> = await!(
         tokio::net::TcpStream::connect(&"149.154.167.50:443".parse().unwrap()))?.into();
@@ -169,6 +170,7 @@ fn kex(log: slog::Logger) -> impl clacks_rpc::error::LocalFuture<()> { async_blo
     println!("answer: {:#?}", answer);
     println!("---sexpr---\n{}\n", ElispFormatter::to_string(&answer).expect("not serialized"));
     println!("---json---\n{}\n---", serde_json::to_string_pretty(&answer).expect("not serialized"));
+    let answer = await!(client.ask(send_code))?;
     Ok(())
 }}
 

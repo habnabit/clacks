@@ -1,8 +1,7 @@
 #![deny(private_in_public, unused_extern_crates)]
-#![recursion_limit = "512"]
 
 #[macro_use] extern crate erased_serde;
-#[macro_use] extern crate error_chain;
+#[macro_use] extern crate failure;
 #[macro_use] extern crate lazy_static;
 #[macro_use] extern crate serde_derive;
 extern crate byteorder;
@@ -13,11 +12,10 @@ extern crate serde;
 
 macro_rules! _invalid_id {
     ($id:ident) => {
-        Err(::error::ErrorKind::InvalidType(Self::possible_constructors(), $id).into())
+        Err(::InvalidConstructor { expected: Self::possible_constructors(), received: $id }.into())
     };
 }
 
-pub mod error;
 pub mod mtproto;
 mod mtproto_prelude;
 
@@ -33,7 +31,14 @@ impl fmt::Debug for ConstructorNumber {
     }
 }
 
-pub type Result<T> = ::std::result::Result<T, ::error::Error>;
+#[derive(Debug, Fail)]
+#[fail(display = "expected a constructor in {:?}; got {:?}", expected, received)]
+pub struct InvalidConstructor {
+    pub expected: Vec<ConstructorNumber>,
+    pub received: ConstructorNumber,
+}
+
+pub type Result<T> = ::std::result::Result<T, ::failure::Error>;
 
 pub struct Deserializer<'r> {
     reader: &'r mut io::Read,

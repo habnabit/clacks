@@ -6,6 +6,7 @@ authors = ["Aaron Gallagher <_@habnab.it>"]
 [dependencies]
 bytes = "*"
 debug_stub_derive = "*"
+failure = "0.1.1"
 futures = "0.1"
 slog = "*"
 smallvec = "*"

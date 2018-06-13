@@ -7,9 +7,9 @@ use clacks_transport;
 use futures::{Future, future};
 use futures::prelude::*;
 use futures::sync::oneshot;
+use kabuki_extras::ext_traits::*;
 
 use client::{InternalEvent, RpcClient};
-use error::{self, LocalFuture};
 
 
 fn u32_bytes(n: u32) -> mtproto::bytes {
@@ -31,21 +31,21 @@ impl<E, F> future::Executor<F> for BoxExecutor<E>
 }
 
 pub fn kex<E>(client: RpcClient, pq_executor: E, expires_in: Option<Duration>)
-             -> impl LocalFuture<(AuthKey, mtproto::FutureSalt)>
+             -> impl FailureFuture<(AuthKey, mtproto::FutureSalt)>
     where E: future::Executor<Box<Future<Item = (), Error = ()> + Send>>
 { async_block! {
     let nonce = csrng_gen();
     let mtproto::ResPQ::ResPQ(pq) = await!(client.ask_plain(mtproto::rpc::ReqPq { nonce }))?;
     assert_eq!(nonce, pq.nonce);
     let server_nonce = pq.server_nonce;
-    let pq_future: oneshot::SpawnHandle<(mtproto::bytes, mtproto::bytes), error::Error> = oneshot::spawn_fn({
+    let pq_future: oneshot::SpawnHandle<(mtproto::bytes, mtproto::bytes), ::failure::Error> = oneshot::spawn_fn({
         let pq_int = BigEndian::read_u64(&pq.pq);
         move || {
             let (p, q) = clacks_crypto::asymm::decompose_pq(pq_int)?;
             Ok((u32_bytes(p), u32_bytes(q)))
         }
     }, &BoxExecutor(pq_executor));
-    let (pubkey, public_key_fingerprint) = clacks_crypto::asymm::find_first_key(&pq.server_public_key_fingerprints)?.unwrap();
+    let (pubkey, public_key_fingerprint) = clacks_crypto::asymm::find_first_key(&pq.server_public_key_fingerprints)?;
     let new_nonce = csrng_gen();
     let (p, q) = await!(pq_future)?;
     let (aes, dh_params) = {
@@ -111,7 +111,7 @@ pub fn kex<E>(client: RpcClient, pq_executor: E, expires_in: Option<Duration>)
     Ok((auth_key, salt))
 }}
 
-pub fn new_auth_key<E>(client: RpcClient, pq_executor: E, temp_key_duration: Duration) -> impl LocalFuture<AuthKey>
+pub fn new_auth_key<E>(client: RpcClient, pq_executor: E, temp_key_duration: Duration) -> impl FailureFuture<AuthKey>
     where E: future::Executor<Box<Future<Item = (), Error = ()> + Send>> + Clone
 { async_block! {
     let (temp_key, salt) = await!(kex(client.clone(), pq_executor.clone(), Some(temp_key_duration)))?;

@@ -7,8 +7,18 @@ use openssl::{aes, symm};
 use std::fmt;
 use std::io::{Cursor, Write};
 
-use error::{ErrorKind, Result};
-use {Padding, csrng_gen, sha1_and_or_pad, sha1_bytes};
+use {Padding, Result, csrng_gen, sha1_and_or_pad, sha1_bytes};
+
+
+#[derive(Debug, Fail)]
+pub enum AuthenticationFailure {
+    #[fail(display = "incorrect key received")]
+    BadKey,
+    #[fail(display = "incorrect length received")]
+    BadLength,
+    #[fail(display = "incorrect hash received")]
+    BadHash,
+}
 
 #[derive(Default, Clone, Copy)]
 pub struct AesParams {
@@ -22,12 +32,16 @@ impl fmt::Debug for AesParams {
     }
 }
 
+#[derive(Debug, Fail)]
+#[fail(display = "input AES key was invalid")]
+pub struct BadAesKey;
+
 impl AesParams {
     fn run_ige(mut self, input: &[u8], mode: symm::Mode) -> Result<Vec<u8>> {
         let key = match mode {
-            symm::Mode::Encrypt => aes::AesKey::new_encrypt(&self.key).unwrap(),
-            symm::Mode::Decrypt => aes::AesKey::new_decrypt(&self.key).unwrap(),
-        };
+            symm::Mode::Encrypt => aes::AesKey::new_encrypt(&self.key),
+            symm::Mode::Decrypt => aes::AesKey::new_decrypt(&self.key),
+        }.map_err(|_: aes::KeyError| BadAesKey)?;
         let mut output = vec![0; input.len()];
         aes::aes_ige(input, &mut output, &key, &mut self.iv, mode);
         Ok(output)
@@ -93,7 +107,7 @@ impl AuthKey {
             (&mut key[size_diff as usize..]).copy_from_slice(key_in);
         } else if size_diff < 0 {
             // key_in longer than key
-            unimplemented!()
+            Err(format_err!("auth key too short"))?
         } else {
             key.copy_from_slice(key_in);
         }
@@ -155,7 +169,9 @@ impl AuthKey {
     }
 
     fn decrypt_message(&self, message: &[u8]) -> Result<Vec<u8>> {
-        assert!(LittleEndian::read_i64(&message[..8]) == self.fingerprint);
+        if LittleEndian::read_i64(&message[..8]) != self.fingerprint {
+            Err(AuthenticationFailure::BadKey)?
+        }
         let message_key = &message[8..24];
         let aes = self.generate_message_aes_params(message_key, symm::Mode::Decrypt)?;
         aes.ige_decrypt(&message[24..])
@@ -171,12 +187,12 @@ impl AuthKey {
         let payload_len = inbound.payload_len as usize;
         let padding = match payload.len().checked_sub(payload_len) {
             Some(i) => i,
-            None => return Err(ErrorKind::AuthenticationFailure.into()),
+            None => Err(AuthenticationFailure::BadLength)?,
         };
         let payload = &payload[..payload_len];
         let computed_message_hash = sha1_bytes(&[&decrypted[..decrypted.len() - padding]])?;
         if &message[8..24] != &computed_message_hash[4..20] {
-            return Err(ErrorKind::AuthenticationFailure.into());
+            Err(AuthenticationFailure::BadHash)?;
         }
         Ok((inbound, payload.into()))
     }

@@ -1,3 +1,4 @@
+use failure::{Error, Fail};
 use futures::{Async, AsyncSink, Canceled, IntoFuture, Poll, Sink, Stream, future, stream};
 use futures::future::FutureResult;
 use futures::unsync::oneshot;
@@ -40,27 +41,29 @@ pub fn ready_to_end(state: kabuki::ActorState) -> Async<()> {
     }
 }
 
-#[derive(Debug)]
-pub struct SinkErrored<E>(pub E);
-#[derive(Debug)]
-pub struct SinkFull<T>(pub T);
+#[derive(Debug, Fail)]
+#[fail(display = "")]
+pub struct SinkErrored;
 
-pub struct SinkActor<Si, EH> {
+#[derive(Debug, Fail)]
+#[fail(display = "")]
+pub struct SinkFull;
+
+pub struct SinkActor<Si> {
     log: Logger,
-    inner: Option<SinkActorInner<Si, EH>>,
+    inner: Option<SinkActorInner<Si>>,
 }
 
-struct SinkActorInner<Si, EH> {
+struct SinkActorInner<Si> {
     sink: Si,
-    error_handler: oneshot::Sender<EH>,
+    error_handler: oneshot::Sender<Error>,
     force_close: bool,
 }
 
-impl<Si, EH> SinkActorInner<Si, EH>
+impl<Si> SinkActorInner<Si>
     where Si: Sink + 'static,
           Si::SinkItem: 'static,
-          Si::SinkError: From<SinkFull<Si::SinkItem>> + From<Canceled> + 'static,
-          EH: fmt::Debug + From<SinkErrored<Si::SinkError>> + 'static,
+          Si::SinkError: Fail,
 {
     fn poll_maybe_close(&mut self, state: kabuki::ActorState) -> Poll<(), Si::SinkError> {
         let () = try_ready!(self.sink.poll_complete());
@@ -76,18 +79,17 @@ impl<Si, EH> SinkActorInner<Si, EH>
     }
 }
 
-pub struct PreparedSinkActor<Ac, EH> {
+pub struct PreparedSinkActor<Ac> {
     pub actor: Ac,
-    pub error_rx: oneshot::Receiver<EH>,
+    pub error_rx: oneshot::Receiver<Error>,
 }
 
-impl<Si, EH> SinkActor<Si, EH>
+impl<Si> SinkActor<Si>
     where Si: Sink + 'static,
           Si::SinkItem: 'static,
-          Si::SinkError: From<SinkFull<Si::SinkItem>> + From<Canceled> + 'static,
-          EH: fmt::Debug + From<SinkErrored<Si::SinkError>> + 'static,
+          Si::SinkError: Fail,
 {
-    pub fn new(log: Logger, sink: Si) -> PreparedSinkActor<Self, EH> {
+    pub fn new(log: Logger, sink: Si) -> PreparedSinkActor<Self> {
         let (error_handler, error_rx) = oneshot::channel();
         let actor = SinkActor {
             log, inner: Some(SinkActorInner { sink, error_handler, force_close: false }),
@@ -95,11 +97,11 @@ impl<Si, EH> SinkActor<Si, EH>
         PreparedSinkActor { actor, error_rx }
     }
 
-    fn enqueue(&mut self, item: Si::SinkItem) -> Result<(), Si::SinkError> {
+    fn enqueue(&mut self, item: Si::SinkItem) -> Result<(), Error> {
         if let Some(ref mut inner) = self.inner {
             match inner.sink.start_send(item)? {
                 AsyncSink::Ready => Ok(()),
-                AsyncSink::NotReady(item) => Err(SinkFull(item).into()),
+                AsyncSink::NotReady(item) => Err(SinkFull)?,
             }
         } else {
             Ok(())
@@ -108,11 +110,11 @@ impl<Si, EH> SinkActor<Si, EH>
 
     fn poll_sink(&mut self, state: kabuki::ActorState) -> Async<()> {
         let log = &self.log;
-        let mut fatal_error_opt: Option<EH> = None;
+        let mut fatal_error_opt: Option<Error> = None;
         let ret = if let Some(ref mut inner) = self.inner {
             inner.poll_maybe_close(state)
                 .map_err(|e| -> () {
-                    let e = SinkErrored(e).into();
+                    let e = Error::context(e.into(), SinkErrored).into();
                     debug!(log, "sink failure"; "error" => ?e);
                     fatal_error_opt = Some(e);
                     inner.force_close();
@@ -133,16 +135,14 @@ impl<Si, EH> SinkActor<Si, EH>
     }
 }
 
-impl<Si, EH> Actor for SinkActor<Si, EH>
+impl<Si> Actor for SinkActor<Si>
     where Si: Sink + 'static,
           Si::SinkItem: 'static,
-          Si::SinkError: From<SinkFull<Si::SinkItem>> + From<Canceled> + 'static,
-          EH: fmt::Debug + From<SinkErrored<Si::SinkError>> + 'static,
+          Si::SinkError: Fail,
 {
     type Request = Si::SinkItem;
     type Response = ();
-    type Error = Si::SinkError;
-    type Future = FutureResult<(), Si::SinkError>;
+    type Future = FutureResult<(), Error>;
 
     fn call(&mut self, item: Self::Request) -> Self::Future {
         future::result(self.enqueue(item))
@@ -154,14 +154,14 @@ impl<Si, EH> Actor for SinkActor<Si, EH>
 }
 
 #[derive(Debug)]
-pub struct StreamEnded<E>(pub Result<(), E>);
+pub struct StreamEnded(pub Result<(), Error>);
 
 pub struct StreamConsumerActorFeeder<S, A, Req>
     where S: Stream + 'static,
           S::Item: Into<Req>,
-          S::Error: fmt::Debug,
+          S::Error: Fail,
           A: Actor<Request = Req, Response = ()> + 'static,
-          Req: From<StreamEnded<S::Error>> + 'static,
+          Req: From<StreamEnded> + 'static,
 {
     log: Logger,
     stream: Option<S>,
@@ -173,9 +173,9 @@ pub struct StreamConsumerActorFeeder<S, A, Req>
 impl<S, A, Req> StreamConsumerActorFeeder<S, A, Req>
     where S: Stream + 'static,
           S::Item: Into<Req>,
-          S::Error: fmt::Debug,
+          S::Error: Fail,
           A: Actor<Request = Req, Response = ()> + 'static,
-          Req: From<StreamEnded<S::Error>> + 'static,
+          Req: From<StreamEnded> + 'static,
 {
     pub fn new(log: Logger, stream: S, actor: A, concurrency: usize) -> Self {
         StreamConsumerActorFeeder {
@@ -208,7 +208,7 @@ impl<S, A, Req> StreamConsumerActorFeeder<S, A, Req>
                 Some(Err(e)) => {
                     debug!(self.log, "stream failed"; "error" => ?e);
                     self.stream = None;
-                    self.processing.push(self.actor.call(StreamEnded(Err(e)).into()).into_future());
+                    self.processing.push(self.actor.call(StreamEnded(Err(e.into())).into()).into_future());
                     break;
                 },
             };
@@ -220,14 +220,12 @@ impl<S, A, Req> StreamConsumerActorFeeder<S, A, Req>
 impl<S, A, Req> Actor for StreamConsumerActorFeeder<S, A, Req>
     where S: Stream + 'static,
           S::Item: Into<Req>,
-          S::Error: fmt::Debug,
+          S::Error: Fail,
           A: Actor<Request = Req, Response = ()> + 'static,
-          A::Error: fmt::Debug,
-          Req: From<StreamEnded<S::Error>> + 'static,
+          Req: From<StreamEnded> + 'static,
 {
     type Request = Req;
     type Response = ();
-    type Error = A::Error;
     type Future = A::Future;
 
     fn call(&mut self, req: Req) -> A::Future {

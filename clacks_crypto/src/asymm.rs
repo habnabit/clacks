@@ -2,9 +2,8 @@ use byteorder::{LittleEndian, ByteOrder};
 use clacks_mtproto::mtproto;
 use openssl::{bn, hash, pkey, rsa};
 
-use error::{ErrorKind, Result};
 use symm::AuthKey;
-use {Padding, sha1_and_or_pad};
+use {Padding, Result, sha1_and_or_pad};
 
 #[derive(Debug)]
 pub struct RsaPublicKeyRef<'a>(&'a [u8]);
@@ -29,7 +28,11 @@ impl<'a> RsaPublicKeyRef<'a> {
     }
 }
 
-pub fn find_first_key(of_fingerprints: &[i64]) -> Result<Option<(RsaPublicKey, i64)>> {
+#[derive(Debug, Fail)]
+#[fail(display = "couldn't find any server public keys to use")]
+pub struct NoKnownKey;
+
+pub fn find_first_key(of_fingerprints: &[i64]) -> Result<(RsaPublicKey, i64)> {
     let iter = KNOWN_KEYS.iter()
         .map(|k| {
             let key = k.read()?;
@@ -42,10 +45,10 @@ pub fn find_first_key(of_fingerprints: &[i64]) -> Result<Option<(RsaPublicKey, i
         });
     for item in iter {
         if let Some(x) = (item as Result<_>)? {
-            return Ok(Some(x))
+            return Ok(x)
         }
     }
-    Ok(None)
+    Err(NoKnownKey)?
 }
 
 pub struct RsaPublicKey(rsa::Rsa<pkey::Public>);
@@ -104,13 +107,17 @@ fn isqrt(x: u64) -> u64 {
     ret
 }
 
+#[derive(Debug, Fail)]
+#[fail(display = "failed to decompose pq into its prime factors")]
+pub struct FactorizationFailure;
+
 pub fn decompose_pq(pq: u64) -> Result<(u32, u32)> {
     let mut pq_sqrt = isqrt(pq);
     loop {
         let y_sqr = pq_sqrt * pq_sqrt - pq;
-        if y_sqr == 0 { return Err(ErrorKind::FactorizationFailure.into()) }
+        if y_sqr == 0 { Err(FactorizationFailure)? }
         let y = isqrt(y_sqr);
-        if y + pq_sqrt >= pq { return Err(ErrorKind::FactorizationFailure.into()) }
+        if y + pq_sqrt >= pq { Err(FactorizationFailure)? }
         if y * y != y_sqr {
             pq_sqrt += 1;
             continue;

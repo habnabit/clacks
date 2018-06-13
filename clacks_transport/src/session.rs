@@ -9,8 +9,24 @@ use either::Either;
 use rand::Rng;
 use std::{cmp, io, mem};
 
-use error::{ErrorKind, Result};
+use Result;
 
+
+#[derive(Debug, Fail)]
+#[fail(display = "telegram error code {}", _0)]
+pub struct ErrorCode(i32);
+
+#[derive(Debug, Fail)]
+pub enum SessionFailure {
+    #[fail(display = "an auth key was needed, but none had been adopted")]
+    NoAuthKey,
+    #[fail(display = "a salt was needed, but none were available")]
+    NoSalts,
+    #[fail(display = "incorrect session ID received")]
+    BadSessionId,
+    #[fail(display = "incorrect salt received")]
+    BadSalt,
+}
 
 fn next_message_id() -> i64 {
     let time = Utc::now();
@@ -230,7 +246,7 @@ impl Session {
         let time = {
             let last_salt = match self.server_salts.last() {
                 Some(s) => s,
-                None => return Err(ErrorKind::NoSalts.into()),
+                None => Err(SessionFailure::NoSalts)?,
             };
             // Make sure at least one salt is retained.
             cmp::min(Utc::now(), last_salt.valid_until.clone())
@@ -268,7 +284,7 @@ impl Session {
     fn fresh_auth_key(&self) -> Result<AuthKey> {
         match self.auth_key {
             Some(ref key) => Ok(key.clone()),
-            None => Err(ErrorKind::NoAuthKey.into()),
+            None => Err(SessionFailure::NoAuthKey.into()),
         }
     }
 
@@ -316,9 +332,9 @@ impl Session {
 
     pub fn process_message(&self, message: &[u8]) -> Result<InboundMessage> {
         if message.len() == 4 {
-            return Err(ErrorKind::ErrorCode(LittleEndian::read_i32(&message)).into());
+            Err(ErrorCode(LittleEndian::read_i32(&message)))?
         } else if message.len() < 8 {
-            panic!("bad message");
+            Err(format_err!("strange message length: {:?}", message))?
         }
 
         let mut cursor = io::Cursor::new(message);
@@ -333,7 +349,7 @@ impl Session {
         let pos = cursor.position() as usize;
         cursor.into_inner();
         if message.len() < pos + len {
-            return Err(ErrorKind::AuthenticationFailure.into());
+            Err(::clacks_crypto::symm::AuthenticationFailure::BadLength)?
         }
         let payload = &message[pos..pos+len];
         Ok(InboundMessage {
@@ -347,10 +363,10 @@ impl Session {
     fn decrypt_message(&self, message: &[u8]) -> Result<InboundMessage> {
         let (inbound, payload) = self.fresh_auth_key()?.decrypt_and_verify_message(message)?;
         if inbound.session_id != self.session_id && Some(inbound.session_id) != self.temp_session_id {
-            return Err(ErrorKind::AuthenticationFailure.into());
+            Err(SessionFailure::BadSessionId)?
         }
         if !self.server_salts.iter().any(|s| s.salt == inbound.salt) {
-            println!("salt failure: {} not in {:#?}", inbound.salt, self.server_salts);
+            Err(SessionFailure::BadSalt)?
         }
         Ok(InboundMessage {
             payload,

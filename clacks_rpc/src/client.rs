@@ -2,7 +2,8 @@ use chrono::{Duration, Utc};
 use clacks_crypto::symm::AuthKey;
 use clacks_mtproto::{BoxedDeserialize, ConstructorNumber, mtproto};
 use clacks_transport::{AppId, Session, TelegramCodec, session};
-use futures::{Future, IntoFuture, Sink, Stream, future, stream};
+use failure::Error;
+use futures::{self, Future, IntoFuture, Sink, Stream, future, stream};
 use futures::unsync::oneshot;
 use kabuki::{self, Actor, ActorRef, ActorRefOf};
 use kabuki_extras::{
@@ -14,7 +15,7 @@ use std::collections::BTreeMap;
 use tokio_io::{AsyncRead, AsyncWrite};
 use tokio_service::Service;
 
-use error::{self, BoxFuture, FutureExtUnit, LocalFuture, Result};
+use Result;
 
 
 #[derive(Debug)]
@@ -24,13 +25,13 @@ pub enum Event {
     ConnectionClosing,
 }
 
-pub type EventDelegate = BoxService<Event, (), ()>;
-type Responder = oneshot::Sender<error::Result<mtproto::TLObject>>;
+pub type EventDelegate = BoxService<Event, (), Error>;
+type Responder = oneshot::Sender<Result<mtproto::TLObject>>;
 
 struct RpcClientActor {
     session: Session,
-    tg_tx: Option<ActorRef<Vec<u8>, (), error::Error>>,
-    sink_error_rx: Option<oneshot::Receiver<error::Error>>,
+    tg_tx: Option<ActorRef<Vec<u8>, ()>>,
+    sink_error_rx: Option<oneshot::Receiver<Error>>,
     delegate: EventDelegate,
     pending_rpcs: BTreeMap<i64, (ConstructorNumber, Responder)>,
 }
@@ -59,10 +60,22 @@ impl From<Vec<u8>> for InternalEvent {
     }
 }
 
-impl From<StreamEnded<io::Error>> for InternalEvent {
-    fn from(e: StreamEnded<io::Error>) -> Self {
+impl From<StreamEnded> for InternalEvent {
+    fn from(e: StreamEnded) -> Self {
         InternalEvent::ConnectionClosed
     }
+}
+
+#[derive(Debug, Fail)]
+pub enum RpcError {
+    #[fail(display = "")]
+    ConnectionClosed,
+    #[fail(display = "")]
+    DuplicateMessageId,
+    #[fail(display = "")]
+    BadReplyType,
+    #[fail(display = "rpc error")]
+    UpstreamRpcError(mtproto::RpcError),
 }
 
 impl RpcClientActor {
@@ -72,7 +85,7 @@ impl RpcClientActor {
     {
         let session = Session::new(app_id);
         let (tg_tx, tg_rx) = stream.framed(TelegramCodec::new()).split();
-        let sink = SinkActor::new(log.clone(), tg_tx.sink_map_err(error::into_error));
+        let sink = SinkActor::new(log.clone(), tg_tx);
         let tg_tx = kabuki::Builder::new().spawn(executor, sink.actor)?;
         let actor = StreamConsumerActorFeeder::new(log, tg_rx, RpcClientActor {
             session,
@@ -89,8 +102,7 @@ impl RpcClientActor {
             Ok(m) => m,
             Err(e) => return Box::new(future::err(e.into())),
         };
-        let payload = mtproto::TLObject::boxed_deserialized_from_bytes(&message.payload)
-            .map_err(error::into_error);
+        let payload = mtproto::TLObject::boxed_deserialized_from_bytes(&message.payload);
         if message.was_encrypted {
             self.maybe_ack(message.seq_no, message.message_id);
             return Box::new({
@@ -119,7 +131,7 @@ impl RpcClientActor {
         let tg_tx = match self.tg_tx {
             Some(ref c) => c,
             None => {
-                let _ = responder.send(Err(error::ErrorKind::ConnectionClosed.into()));
+                let _ = responder.send(Err(RpcError::ConnectionClosed.into()));
                 return Box::new(future::ok(()));
             },
         };
@@ -128,14 +140,13 @@ impl RpcClientActor {
                 e.insert((message.constructor(), responder));
             },
             Occupied(_) => {
-                let _ = responder.send(Err(error::ErrorKind::DuplicateMessageId.into()));
+                let _ = responder.send(Err(RpcError::DuplicateMessageId.into()));
                 return Box::new(future::ok(()));
             },
         }
         Box::new({
             self.session.serialize_message(message)
-                .map_err(error::into_error)
-                .map(|v| tg_tx.call(v).map_err(error::into_error))
+                .map(|v| tg_tx.call(v))
                 .into_future()
                 .and_then(|f| f)
         })
@@ -155,13 +166,12 @@ impl RpcClientActor {
             .map(|message| self.send_message(message.lift(), tx));
         Box::new({
             future::result(bound)
-                .map_err(error::into_error)
-                .and_then(|f| rx.map_err(error::into_error).join(f))
+                .and_then(|f| rx.map_err(Canceled::as_error).join(f))
                 .and_then(|(r, ())| r)
                 .and_then(|o| match AuthKey::downcast_bind_temp_auth_key(o) {
                     Ok(true) => Ok(()),
-                    Ok(false) => unimplemented!(),
-                    Err(e) => Err(error::ErrorKind::WrongReplyType(e).into())
+                    Ok(false) => Err(format_err!("confusing Ok(false) from bind_auth_key"))?,
+                    Err(e) => Err(RpcError::BadReplyType)?,
                 })
         })
     }
@@ -177,7 +187,7 @@ impl RpcClientActor {
             },
             ConnectionClosed => Box::new({
                 self.close_connection()
-                    .map_unit_err("closing connection")
+                    .map_err(|e| e.context(format_err!("closing connection")).into())
             }),
             BindAuthKey { perm_key, temp_key, temp_key_duration, salt } =>
                 self.bind_auth_key(perm_key, temp_key, temp_key_duration, salt),
@@ -226,8 +236,10 @@ macro_rules! scan_type_impl {
     };
 
     (@obj($self:ident, $obj:ident)) => {
-        $self.delegate.call(Event::Unhandled($obj))
-            .map_unit_err("sending Unhandled to the delegate")
+        Box::new({
+            $self.delegate.call(Event::Unhandled($obj))
+                .map_err(|e| e.context(format_err!("sending Unhandled to the delegate")).into())
+        })
     };
 }
 
@@ -258,7 +270,7 @@ scan_type! {
             }
         };
         let result = match rpc.result.downcast::<mtproto::RpcError>() {
-            Ok(err) => Err(error::ErrorKind::RpcError(err).into()),
+            Ok(err) => Err(RpcError::UpstreamRpcError(err).into()),
             Err(obj) => Ok(obj),
         };
         let _ = replier.send(result);
@@ -269,7 +281,6 @@ scan_type! {
 impl Actor for RpcClientActor {
     type Request = InternalEvent;
     type Response = ();
-    type Error = error::Error;
     type Future = BoxFuture<()>;
 
     fn call(&mut self, req: Self::Request) -> Self::Future {
@@ -292,33 +303,33 @@ impl RpcClient {
             .map(|actor_tx| RpcClient { actor_tx })
     }
 
-    pub fn ask<M: ::clacks_mtproto::Function>(&self, query: M) -> impl LocalFuture<M::Reply> {
+    pub fn ask<M: ::clacks_mtproto::Function>(&self, query: M) -> impl FailureFuture<M::Reply> {
         self.ask_inner::<M>(session::EitherMessageBuilder::encrypted(query))
     }
 
-    pub(crate) fn ask_plain<M: ::clacks_mtproto::Function>(&self, query: M) -> impl LocalFuture<M::Reply> {
+    pub(crate) fn ask_plain<M: ::clacks_mtproto::Function>(&self, query: M) -> impl FailureFuture<M::Reply> {
         self.ask_inner::<M>(session::EitherMessageBuilder::plain(query))
     }
 
-    fn ask_inner<M: ::clacks_mtproto::Function>(&self, query: session::EitherMessageBuilder) -> impl LocalFuture<M::Reply> {
+    fn ask_inner<M: ::clacks_mtproto::Function>(&self, query: session::EitherMessageBuilder) -> impl FailureFuture<M::Reply> {
         self.actor_tx.ask(InternalEvent::Outbound, query)
                 .and_then(|r| r)
                 .and_then(|obj| match obj.downcast::<M::Reply>() {
                     Ok(r) => Ok(r),
-                    Err(b) => Err(error::ErrorKind::WrongReplyType(b).into()),
+                    Err(b) => Err(RpcError::BadReplyType.into()),
                 })
     }
 
-    pub fn set_delegate(&self, delegate: EventDelegate) -> impl LocalFuture<()> {
+    pub fn set_delegate(&self, delegate: EventDelegate) -> impl FailureFuture<()> {
         self.actor_tx.call(InternalEvent::SetDelegate(delegate))
     }
 
-    pub fn new_auth_key(&self, temp_key_duration: Duration) -> impl LocalFuture<AuthKey> {
+    pub fn new_auth_key(&self, temp_key_duration: Duration) -> impl FailureFuture<AuthKey> {
         ::kex::kex(self.clone(), one_cpupool(), None)
             .map(|(k, _)| k)
     }
 
-    pub(crate) fn call(&self, req: InternalEvent) -> impl LocalFuture<()> {
+    pub(crate) fn call(&self, req: InternalEvent) -> impl FailureFuture<()> {
         self.actor_tx.call(req)
     }
 }

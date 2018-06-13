@@ -22,16 +22,21 @@
 // - Use UnparkEvent once in-flight passes some threshold
 // - Conditionally depend on tokio-core
 
+#[macro_use] extern crate failure;
 #[macro_use] extern crate scoped_tls;
 extern crate futures;
 extern crate tokio_service;
 
+use failure::Error;
 use futures::{Future, Stream, IntoFuture, Async, AsyncSink, Sink, Poll, future};
 use futures::sync::{mpsc, oneshot};
 use tokio_service::Service;
 
 use std::mem;
 use std::marker::PhantomData;
+
+
+type Result<T> = ::std::result::Result<T, Error>;
 
 /// A value that manages state and responds to messages
 pub trait Actor {
@@ -41,12 +46,9 @@ pub trait Actor {
     /// The response sent back from the actor
     type Response: 'static;
 
-    /// The response error
-    type Error: 'static;
-
     /// The internal response future. This will remain on the actor's task and
     /// will be polled to completion before being sent back to the caller.
-    type Future: IntoFuture<Item = Self::Response, Error = Self::Error>;
+    type Future: IntoFuture<Item = Self::Response, Error = Error>;
 
     /// Poll the `Actor` to see if it has completed processing.
     ///
@@ -84,8 +86,8 @@ pub struct ActorFn<F, T> {
 }
 
 /// The return value of `ActorRef::call`
-pub struct ActorFuture<T, U, E> {
-    state: CallState<T, U, E>,
+pub struct ActorFuture<U> {
+    state: CallState<U>,
 }
 
 /// Tracks the state of the actor
@@ -104,9 +106,9 @@ enum ActorStatePriv {
     Shutdown,
 }
 
-enum CallState<T, U, E> {
-    Waiting(oneshot::Receiver<Result<U, E>>),
-    Error(CallError<T>),
+enum CallState<U> {
+    Waiting(oneshot::Receiver<Result<U>>),
+    Error(CallError),
     Consumed,
 }
 
@@ -120,7 +122,7 @@ pub struct Builder {
 
 struct ActorAndOutbox<A: Actor> {
     actor: A,
-    outbox: Outbox<A::Request, A::Response, A::Error>,
+    outbox: Outbox<A::Request, A::Response>,
 }
 
 /// Manages the runtime state of an `Actor`.
@@ -132,7 +134,7 @@ pub struct ActorCell<A: Actor> {
     state: ActorStatePriv,
 
     // The actors inbox
-    rx: mpsc::Receiver<Envelope<A::Request, A::Response, A::Error>>,
+    rx: mpsc::Receiver<Envelope<A::Request, A::Response>>,
 
     // A slab of futures that are being executed. Each slot in this vector is
     // either an active future or a pointer to the next empty slot. This is used
@@ -152,38 +154,47 @@ pub struct ActorCell<A: Actor> {
 }
 
 /// The sender to a potentially running actor
-pub struct Outbox<T, U, E>(mpsc::Sender<Envelope<T, U, E>>);
+pub struct Outbox<T, U>(mpsc::Sender<Envelope<T, U>>);
 
-impl<T, U, E> Clone for Outbox<T, U, E> {
+impl<T, U> Clone for Outbox<T, U> {
     fn clone(&self) -> Self {
         Outbox(self.0.clone())
     }
 }
 
 /// Handle to an actor, used to send messages
-pub struct ActorRef<T, U, E>(Outbox<T, U, E>);
+pub struct ActorRef<T, U>(Outbox<T, U>);
 
 /// The `ActorRef` for a given `Actor`
-pub type ActorRefOf<A> = ActorRef<<A as Actor>::Request, <A as Actor>::Response, <A as Actor>::Error>;
+pub type ActorRefOf<A> = ActorRef<<A as Actor>::Request, <A as Actor>::Response>;
 
 /// Used to represent `call` errors
-pub enum CallError<T> {
+#[derive(Debug, Fail)]
+pub enum CallError {
     /// The actor's inbox is full
-    Full(T),
+    #[fail(display = "actor's inbox was full")]
+    Full,
     /// The actor has shutdown
-    Disconnected(T),
+    #[fail(display = "actor's inboxed closed due to shutdown")]
+    Disconnected,
     /// The actor aborted processing the request for some reason
+    #[fail(display = "actor aborted processing")]
     Aborted,
 }
 
-struct Envelope<T, U, E> {
+/// Used to represent an actor failing to start
+#[derive(Debug, Fail)]
+#[fail(display = "actor failed to spawn: {:?}", _0)]
+pub struct SpawnError(pub futures::future::ExecuteErrorKind);
+
+struct Envelope<T, U> {
     arg: T,
-    ret: oneshot::Sender<Result<U, E>>,
+    ret: oneshot::Sender<Result<U>>,
 }
 
 struct Processing<A: Actor> {
     future: <A::Future as IntoFuture>::Future,
-    ret: Option<oneshot::Sender<Result<A::Response, A::Error>>>,
+    ret: Option<oneshot::Sender<Result<A::Response>>>,
 }
 
 // Stores in-flight responses
@@ -244,30 +255,29 @@ impl Builder {
     }
 
     /// Spawn a new actor
-    pub fn spawn<A, E>(self, e: &E, actor: A) -> Result<ActorRefOf<A>, future::ExecuteErrorKind>
+    pub fn spawn<A, Ex>(self, ex: &Ex, actor: A) -> Result<ActorRefOf<A>>
         where A: Actor + 'static,
-              E: future::Executor<Box<Future<Item = (), Error = ()>>>,
+              Ex: future::Executor<Box<Future<Item = (), Error = ()>>>,
     {
         let (actor_ref, actor_cell) = self.pair(actor);
-        e.execute(Box::new(actor_cell))
+        ex.execute(Box::new(actor_cell))
             .map(|()| actor_ref)
-            .map_err(|e| e.kind())
+            .map_err(|e| SpawnError(e.kind()).into())
     }
 
     /// Spawn the given closure as an actor
-    pub fn spawn_fn<F, T, U, E>(self, e: &E, f: F) -> Result<ActorRef<T, U::Item, U::Error>, future::ExecuteErrorKind>
+    pub fn spawn_fn<F, T, U, Ex>(self, ex: &Ex, f: F) -> Result<ActorRef<T, U::Item>>
         where F: Fn(T) -> U + 'static,
               T: 'static,
-              U: IntoFuture + 'static,
-              E: future::Executor<Box<Future<Item = (), Error = ()>>>,
+              U: IntoFuture<Error = Error> + 'static,
+              Ex: future::Executor<Box<Future<Item = (), Error = ()>>>,
     {
-        self.spawn(e, actor_fn(f))
+        self.spawn(ex, actor_fn(f))
     }
 
     fn pair<A>(self, actor: A) -> (ActorRefOf<A>, ActorCell<A>)
         where A: Actor,
               A::Request: 'static,
-              A::Error: 'static,
     {
         // TODO: respect inbox bound
         let (tx, rx) = mpsc::channel(self.inbox);
@@ -296,11 +306,10 @@ impl Default for Builder {
 
 impl<F, T: 'static, U: 'static> Actor for ActorFn<F, T>
     where F: FnMut(T) -> U,
-          U: IntoFuture,
+          U: IntoFuture<Error = Error>,
 {
     type Request = T;
     type Response = U::Item;
-    type Error = U::Error;
     type Future = U;
 
     fn call(&mut self, req: Self::Request) -> Self::Future {
@@ -315,14 +324,12 @@ impl<F, T: 'static, U: 'static> Actor for ActorFn<F, T>
  */
 
 
-impl<T: 'static, U: 'static, E: 'static> ActorRef<T, U, E>
-    where E: From<CallError<T>>,
-{
+impl<T: 'static, U: 'static> ActorRef<T, U> {
     /// A handle to the currently-running actor
     pub fn current() -> Option<Self> {
         if CURRENT_ACTOR_REF.is_set() {
             CURRENT_ACTOR_REF.with(|any| {
-                unsafe { &**any }.downcast_ref::<mpsc::Sender<Envelope<T, U, E>>>().cloned()
+                unsafe { &**any }.downcast_ref::<mpsc::Sender<Envelope<T, U>>>().cloned()
                     .map(|tx| ActorRef(Outbox(tx)))
             })
         } else {
@@ -331,22 +338,20 @@ impl<T: 'static, U: 'static, E: 'static> ActorRef<T, U, E>
     }
 }
 
-impl<T, U, E> Clone for ActorRef<T, U, E> {
+impl<T, U> Clone for ActorRef<T, U> {
     fn clone(&self) -> Self {
         ActorRef(self.0.clone())
     }
 }
 
-impl<T, U, E> Service for ActorRef<T, U, E>
-    where E: From<CallError<T>>,
-{
+impl<T, U> Service for ActorRef<T, U> {
     type Request = T;
     type Response = U;
-    type Error = E;
-    type Future = ActorFuture<T, U, E>;
+    type Error = Error;
+    type Future = ActorFuture<U>;
 
     /// Send a request to the actor
-    fn call(&self, request: T) -> ActorFuture<T, U, E> {
+    fn call(&self, request: T) -> ActorFuture<U> {
         let (tx, rx) = oneshot::channel();
 
         let mut outbox = (self.0).0.clone();
@@ -362,15 +367,15 @@ impl<T, U, E> Service for ActorRef<T, U, E>
             }
             Ok(AsyncSink::NotReady(request)) => {
                 let Envelope { arg, .. } = request;
-                CallState::Error(CallError::Full(arg))
+                CallState::Error(CallError::Full)
             }
             Err(err) => {
                 let Envelope { arg, .. } = err.into_inner();
-                CallState::Error(CallError::Disconnected(arg))
+                CallState::Error(CallError::Disconnected)
             }
         };
 
-        ActorFuture { state: state }
+        ActorFuture { state }
     }
 }
 
@@ -380,13 +385,11 @@ impl<T, U, E> Service for ActorRef<T, U, E>
  *
  */
 
-impl<T, U, E> Future for ActorFuture<T, U, E>
-    where E: From<CallError<T>>,
-{
+impl<U> Future for ActorFuture<U> {
     type Item = U;
-    type Error = E;
+    type Error = Error;
 
-    fn poll(&mut self) -> Poll<U, E> {
+    fn poll(&mut self) -> Poll<U, Error> {
         match self.state {
             CallState::Waiting(ref mut rx) => {
                 match rx.poll() {
@@ -415,8 +418,8 @@ impl<T, U, E> Future for ActorFuture<T, U, E>
 
 impl<A: Actor> ActorCell<A> {
     fn new(actor: A,
-           tx: mpsc::Sender<Envelope<A::Request, A::Response, A::Error>>,
-           rx: mpsc::Receiver<Envelope<A::Request, A::Response, A::Error>>,
+           tx: mpsc::Sender<Envelope<A::Request, A::Response>>,
+           rx: mpsc::Receiver<Envelope<A::Request, A::Response>>,
            max_in_flight: usize)
         -> ActorCell<A>
     {
@@ -618,37 +621,14 @@ impl ActorStatePriv {
     }
 }
 
-/*
- *
- * ===== impl From<CallError> =====
- *
- */
-
-impl<T> From<CallError<T>> for () {
-    fn from(_: CallError<T>) -> () {
-    }
-}
-
-impl<T> From<CallError<T>> for ::std::io::Error {
-    fn from(src: CallError<T>) -> ::std::io::Error {
-        use std::io;
-
-        match src {
-            CallError::Full(..) => io::Error::new(io::ErrorKind::Other, "actor inbox full"),
-            CallError::Disconnected(..) => io::Error::new(io::ErrorKind::Other, "actor shutdown"),
-            CallError::Aborted => io::Error::new(io::ErrorKind::Other, "actor aborted request"),
-        }
-    }
-}
-
 /// A service which drops all requests and returns `()`
-pub struct NullService<T, E>(PhantomData<fn(T) -> E>);
+pub struct NullService<T>(PhantomData<fn(T)>);
 
-impl<T, E> Service for NullService<T, E> {
+impl<T> Service for NullService<T> {
     type Request = T;
     type Response = ();
-    type Error = E;
-    type Future = future::Ok<(), E>;
+    type Error = Error;
+    type Future = future::Ok<(), Error>;
 
     fn call(&self, _: Self::Request) -> Self::Future {
         future::ok(())
@@ -656,6 +636,6 @@ impl<T, E> Service for NullService<T, E> {
 }
 
 /// Returns a service which drops all requests and returns `()`
-pub fn null<T, E>() -> NullService<T, E> {
+pub fn null<T>() -> NullService<T> {
     NullService(PhantomData)
 }
