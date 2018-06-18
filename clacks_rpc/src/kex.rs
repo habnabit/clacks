@@ -1,15 +1,16 @@
+use actix::prelude::*;
 use byteorder::{BigEndian, ByteOrder, LittleEndian};
 use chrono::Duration;
 use clacks_crypto::{self, csrng_gen};
 use clacks_crypto::symm::AuthKey;
 use clacks_mtproto::{BoxedSerialize, IntoBoxed, mtproto};
 use clacks_transport;
+use failure::Error;
 use futures::{Future, future};
 use futures::prelude::*;
 use futures::sync::oneshot;
-use kabuki_extras::ext_traits::*;
 
-use client::{InternalEvent, RpcClient};
+use client;
 
 
 fn u32_bytes(n: u32) -> mtproto::bytes {
@@ -30,12 +31,12 @@ impl<E, F> future::Executor<F> for BoxExecutor<E>
     }
 }
 
-pub fn kex<E>(client: RpcClient, pq_executor: E, expires_in: Option<Duration>)
-             -> impl FailureFuture<(AuthKey, mtproto::FutureSalt)>
+pub fn kex<E>(addr: Addr<Unsync, client::RpcClientActor>, pq_executor: E, expires_in: Option<Duration>)
+             -> impl Future<Item = (AuthKey, mtproto::FutureSalt), Error = Error>
     where E: future::Executor<Box<Future<Item = (), Error = ()> + Send>>
 { async_block! {
     let nonce = csrng_gen();
-    let mtproto::ResPQ::ResPQ(pq) = await!(client.ask_plain(mtproto::rpc::ReqPq { nonce }))?;
+    let mtproto::ResPQ::ResPQ(pq) = await!(addr.send(client::SendMessage::plain(mtproto::rpc::ReqPq { nonce })))??;
     assert_eq!(nonce, pq.nonce);
     let server_nonce = pq.server_nonce;
     let pq_future: oneshot::SpawnHandle<(mtproto::bytes, mtproto::bytes), ::failure::Error> = oneshot::spawn_fn({
@@ -69,9 +70,9 @@ pub fn kex<E>(client: RpcClient, pq_executor: E, expires_in: Option<Duration>)
         };
         let aes = clacks_crypto::symm::AesParams::from_pq_inner_data(&inner)?;
         let encrypted_data = pubkey.encrypt(&inner.boxed_serialized_bytes()?)?.into();
-        let dh_params = await!(client.ask_plain(mtproto::rpc::ReqDHParams {
+        let dh_params = await!(addr.send(client::SendMessage::plain(mtproto::rpc::ReqDHParams {
             nonce, server_nonce, public_key_fingerprint, encrypted_data, p, q,
-        }))?;
+        })))??;
         (aes, dh_params)
     };
     let dh_params = match dh_params {
@@ -96,7 +97,7 @@ pub fn kex<E>(client: RpcClient, pq_executor: E, expires_in: Option<Duration>)
         }.into_boxed();
         let encrypted_data = aes.ige_encrypt(&inner.boxed_serialized_bytes()?, true)?.into();
         let set_dh = mtproto::rpc::SetClientDHParams { nonce, server_nonce, encrypted_data };
-        await!(client.ask_plain(set_dh))?
+        await!(addr.send(client::SendMessage::plain(set_dh)))??
     };
     let expected_new_nonce_hash1 = auth_key.new_nonce_hash(1, new_nonce)?;
     match dh_answer {
@@ -111,14 +112,14 @@ pub fn kex<E>(client: RpcClient, pq_executor: E, expires_in: Option<Duration>)
     Ok((auth_key, salt))
 }}
 
-pub fn new_auth_key<E>(client: RpcClient, pq_executor: E, temp_key_duration: Duration) -> impl FailureFuture<AuthKey>
+pub fn new_auth_key<E>(addr: Addr<Unsync, client::RpcClientActor>, pq_executor: E, temp_key_duration: Duration) -> impl Future<Item = AuthKey, Error = Error>
     where E: future::Executor<Box<Future<Item = (), Error = ()> + Send>> + Clone
 { async_block! {
-    let (temp_key, salt) = await!(kex(client.clone(), pq_executor.clone(), Some(temp_key_duration)))?;
-    let (perm_key, _) = await!(kex(client.clone(), pq_executor, None))?;
-    await!(client.call(InternalEvent::BindAuthKey {
+    let (temp_key, salt) = await!(kex(addr.clone(), pq_executor.clone(), Some(temp_key_duration)))?;
+    let (perm_key, _) = await!(kex(addr.clone(), pq_executor, None))?;
+    await!(addr.send(client::BindAuthKey {
         temp_key, temp_key_duration, salt,
         perm_key: perm_key.clone(),
-    }))?;
+    }))??;
     Ok(perm_key)
 }}

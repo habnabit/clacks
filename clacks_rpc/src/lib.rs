@@ -2,17 +2,16 @@
 #![deny(private_in_public, unused_extern_crates)]
 
 #[macro_use] extern crate failure;
-#[macro_use] extern crate kabuki_extras;
 #[macro_use] extern crate slog;
+extern crate actix;
 extern crate byteorder;
 extern crate chrono;
 extern crate clacks_crypto;
 extern crate clacks_mtproto;
 extern crate clacks_transport;
 extern crate futures_cpupool;
-extern crate kabuki;
+extern crate tokio_codec;
 extern crate tokio_io;
-extern crate tokio_service;
 
 
 #[cfg(not(feature = "kex"))]

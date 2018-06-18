@@ -7,8 +7,6 @@ members = [
     "clacks_rpc",
     "clacks_tl_codegen",
     "clacks_transport",
-    "kabuki",
-    "kabuki_extras",
     "keyring-rs",
     "rust-delegate",
     "rust-security-framework/security-framework-sys",

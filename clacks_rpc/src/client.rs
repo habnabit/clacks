@@ -1,69 +1,30 @@
+use actix::{self, Actor, Addr, Arbiter, AsyncContext, Context, StreamHandler, Syn, System, Unsync};
+use actix::prelude::*;
 use chrono::{Duration, Utc};
 use clacks_crypto::symm::AuthKey;
-use clacks_mtproto::{BoxedDeserialize, ConstructorNumber, mtproto};
+use clacks_mtproto::{AnyBoxedSerialize, BoxedDeserialize, ConstructorNumber, mtproto};
 use clacks_transport::{AppId, Session, TelegramCodec, session};
 use failure::Error;
 use futures::{self, Future, IntoFuture, Sink, Stream, future, stream};
 use futures::unsync::oneshot;
-use kabuki::{self, Actor, ActorRef, ActorRefOf};
-use kabuki_extras::{
-    BoxService, ErasedService, SinkActor, StreamConsumerActorFeeder, StreamEnded};
-use kabuki_extras::ext_traits::*;
 use slog::Logger;
 use std::io;
 use std::collections::BTreeMap;
-use tokio_io::{AsyncRead, AsyncWrite};
-use tokio_service::Service;
+use std::marker::PhantomData;
+use tokio_codec;
+use tokio_io;
 
 use Result;
 
 
-#[derive(Debug)]
-pub enum Event {
-    Updates(mtproto::Updates),
-    Unhandled(mtproto::TLObject),
-    ConnectionClosing,
-}
-
-pub type EventDelegate = BoxService<Event, (), Error>;
 type Responder = oneshot::Sender<Result<mtproto::TLObject>>;
 
-struct RpcClientActor {
+pub struct RpcClientActor {
     session: Session,
-    tg_tx: Option<ActorRef<Vec<u8>, ()>>,
-    sink_error_rx: Option<oneshot::Receiver<Error>>,
-    delegate: EventDelegate,
+    tg_tx: Option<actix::io::FramedWrite<Box<tokio_io::AsyncWrite>, TelegramCodec>>,
+    tg_rx: actix::SpawnHandle,
+    delegates: EventDelegates,
     pending_rpcs: BTreeMap<i64, (ConstructorNumber, Responder)>,
-}
-
-#[derive(Clone)]
-pub struct RpcClient {
-    actor_tx: ActorRefOf<RpcClientActor>,
-}
-
-pub(crate) enum InternalEvent {
-    Inbound(Vec<u8>),
-    Outbound(session::EitherMessageBuilder, Responder),
-    ConnectionClosed,
-    SetDelegate(EventDelegate),
-    BindAuthKey {
-        perm_key: AuthKey,
-        temp_key: AuthKey,
-        temp_key_duration: Duration,
-        salt: mtproto::FutureSalt,
-    },
-}
-
-impl From<Vec<u8>> for InternalEvent {
-    fn from(v: Vec<u8>) -> Self {
-        InternalEvent::Inbound(v)
-    }
-}
-
-impl From<StreamEnded> for InternalEvent {
-    fn from(e: StreamEnded) -> Self {
-        InternalEvent::ConnectionClosed
-    }
 }
 
 #[derive(Debug, Fail)]
@@ -79,44 +40,20 @@ pub enum RpcError {
 }
 
 impl RpcClientActor {
-    fn spawn<E, S>(executor: &E, log: Logger, app_id: AppId, stream: S) -> Result<ActorRefOf<RpcClientActor>>
-        where E: future::Executor<Box<Future<Item = (), Error = ()>>>,
-              S: AsyncRead + AsyncWrite + 'static,
+    pub fn from_context<S>(ctx: &mut Context<Self>, log: Logger, app_id: AppId, stream: S) -> Self
+        where S: tokio_io::AsyncRead + tokio_io::AsyncWrite + 'static,
     {
         let session = Session::new(app_id);
-        let (tg_tx, tg_rx) = stream.framed(TelegramCodec::new()).split();
-        let sink = SinkActor::new(log.clone(), tg_tx);
-        let tg_tx = kabuki::Builder::new().spawn(executor, sink.actor)?;
-        let actor = StreamConsumerActorFeeder::new(log, tg_rx, RpcClientActor {
-            session,
+        let (tg_rx, tg_tx) = stream.split();
+        let tg_rx = ctx.add_stream(tokio_codec::FramedRead::new(tg_rx, TelegramCodec::new()));
+        let tg_tx: Box<tokio_io::AsyncWrite> = Box::new(tg_tx);
+        let tg_tx = actix::io::FramedWrite::new(tg_tx, TelegramCodec::new(), ctx);
+        RpcClientActor {
+            session, tg_rx,
             tg_tx: Some(tg_tx),
-            sink_error_rx: Some(sink.error_rx),
-            delegate: ErasedService::new_erased(kabuki::null()),
+            delegates: Default::default(),
             pending_rpcs: BTreeMap::new(),
-        }, 5);
-        Ok(kabuki::Builder::new().spawn(executor, actor)?)
-    }
-
-    fn process_message(&mut self, vec: Vec<u8>) -> <Self as Actor>::Future {
-        let message = match self.session.process_message(&vec) {
-            Ok(m) => m,
-            Err(e) => return Box::new(future::err(e.into())),
-        };
-        let payload = mtproto::TLObject::boxed_deserialized_from_bytes(&message.payload);
-        if message.was_encrypted {
-            self.maybe_ack(message.seq_no, message.message_id);
-            return Box::new({
-                future::result(payload.map(|o| self.scan_replies(o)))
-                    .and_then(|f| f)
-            });
-        } else if self.pending_rpcs.len() != 1 {
-            // XXX: can't dispatch this message
-        } else {
-            let key = *self.pending_rpcs.keys().next().unwrap();
-            let (_, sender) = self.pending_rpcs.remove(&key).unwrap();
-            let _ = sender.send(payload);
         }
-        Box::new(future::ok(()))
     }
 
     fn maybe_ack(&mut self, seq_no: Option<i32>, message_id: i64) {
@@ -125,94 +62,162 @@ impl RpcClientActor {
             _ => (),
         }
     }
+}
 
-    fn send_message(&mut self, message: session::EitherMessageBuilder, responder: Responder) -> <Self as Actor>::Future {
-        use std::collections::btree_map::Entry::*;
-        let tg_tx = match self.tg_tx {
-            Some(ref c) => c,
-            None => {
-                let _ = responder.send(Err(RpcError::ConnectionClosed.into()));
-                return Box::new(future::ok(()));
-            },
+impl Actor for RpcClientActor {
+    type Context = Context<Self>;
+
+    fn started(&mut self, ctx: &mut Self::Context) {
+
+    }
+}
+
+impl actix::io::WriteHandler<io::Error> for RpcClientActor {
+
+}
+
+impl StreamHandler<Vec<u8>, io::Error> for RpcClientActor {
+    fn handle(&mut self, vec: Vec<u8>, ctx: &mut Self::Context) {
+        let message = match self.session.process_message(&vec) {
+            Ok(m) => m,
+            Err(e) => return,
         };
-        match self.pending_rpcs.entry(message.message_id()) {
-            Vacant(e) => {
-                e.insert((message.constructor(), responder));
-            },
-            Occupied(_) => {
-                let _ = responder.send(Err(RpcError::DuplicateMessageId.into()));
-                return Box::new(future::ok(()));
-            },
+        let payload = mtproto::TLObject::boxed_deserialized_from_bytes(&message.payload);
+        if message.was_encrypted {
+            self.maybe_ack(message.seq_no, message.message_id);
+            match payload.and_then(|o| self.scan_replies(ctx, o)) {
+                Ok(()) => (),
+                Err(e) => {
+
+                },
+            }
+        } else if self.pending_rpcs.len() != 1 {
+            // XXX: can't dispatch this message
+        } else {
+            let key = *self.pending_rpcs.keys().next().unwrap();
+            let (_, sender) = self.pending_rpcs.remove(&key).unwrap();
+            let _ = sender.send(payload);
         }
-        Box::new({
-            self.session.serialize_message(message)
-                .map(|v| tg_tx.call(v))
-                .into_future()
-                .and_then(|f| f)
-        })
     }
 
-    fn close_connection(&mut self) -> <EventDelegate as Service>::Future {
-        self.tg_tx = None;
-        self.sink_error_rx = None;
-        self.delegate.call(Event::ConnectionClosing)
+}
+
+pub struct SendMessage<R> {
+    builder: session::EitherMessageBuilder,
+    _dummy: PhantomData<fn() -> R>,
+}
+
+impl<R> SendMessage<R>
+    where R: BoxedDeserialize + AnyBoxedSerialize,
+{
+    pub fn encrypted<M>(query: M) -> Self
+        where M: ::clacks_mtproto::Function<Reply = R>,
+    {
+        SendMessage {
+            builder: session::EitherMessageBuilder::encrypted(query),
+            _dummy: PhantomData,
+        }
     }
 
-    fn bind_auth_key(&mut self, perm_key: AuthKey, temp_key: AuthKey, temp_key_duration: Duration, salt: mtproto::FutureSalt) -> <Self as Actor>::Future {
-        self.session.adopt_key(temp_key);
-        self.session.add_server_salts(::std::iter::once(salt));
-        let (tx, rx) = oneshot::channel();
-        let bound = self.session.bind_auth_key(perm_key, temp_key_duration)
-            .map(|message| self.send_message(message.lift(), tx));
-        Box::new({
-            future::result(bound)
-                .and_then(|f| rx.map_err(Canceled::as_error).join(f))
-                .and_then(|(r, ())| r)
-                .and_then(|o| match AuthKey::downcast_bind_temp_auth_key(o) {
-                    Ok(true) => Ok(()),
-                    Ok(false) => Err(format_err!("confusing Ok(false) from bind_auth_key"))?,
-                    Err(e) => Err(RpcError::BadReplyType)?,
-                })
-        })
-    }
-
-    fn process_sync(&mut self, req: InternalEvent) -> <Self as Actor>::Future {
-        use self::InternalEvent::*;
-        match req {
-            Inbound(message) => self.process_message(message),
-            Outbound(message, responder) => self.send_message(message, responder),
-            SetDelegate(delegate) => {
-                self.delegate = delegate;
-                Box::new(future::ok(()))
-            },
-            ConnectionClosed => Box::new({
-                self.close_connection()
-                    .map_err(|e| e.context(format_err!("closing connection")).into())
-            }),
-            BindAuthKey { perm_key, temp_key, temp_key_duration, salt } =>
-                self.bind_auth_key(perm_key, temp_key, temp_key_duration, salt),
+    pub(crate) fn plain<M>(query: M) -> Self
+        where M: ::clacks_mtproto::Function<Reply = R>,
+    {
+        SendMessage {
+            builder: session::EitherMessageBuilder::plain(query),
+            _dummy: PhantomData,
         }
     }
 }
 
-struct Scan<'a, S>(&'a mut RpcClientActor, S);
+impl<R: 'static> Message for SendMessage<R> {
+    type Result = Result<R>;
+}
+
+impl<R> Handler<SendMessage<R>> for RpcClientActor
+    where R: BoxedDeserialize + AnyBoxedSerialize,
+{
+    type Result = ResponseFuture<R, Error>;
+
+    fn handle(&mut self, message: SendMessage<R>, ctx: &mut Self::Context) -> Self::Result {
+        use std::collections::btree_map::Entry::*;
+        let tg_tx = match self.tg_tx {
+            Some(ref mut c) => c,
+            None => {
+                return Box::new(future::err(RpcError::ConnectionClosed.into()));
+            },
+        };
+        let message = message.builder;
+        let (tx, rx) = oneshot::channel();
+        match self.pending_rpcs.entry(message.message_id()) {
+            Vacant(e) => {
+                e.insert((message.constructor(), tx));
+            },
+            Occupied(_) => {
+                return Box::new(future::err(RpcError::DuplicateMessageId.into()));
+            },
+        }
+        Box::new({
+            self.session.serialize_message(message)
+                .map(|v| tg_tx.write(v))
+                .into_future()
+                .and_then(move |()| rx.map_err(Into::into))
+                .and_then(|r| r)
+                .and_then(|o| match o.downcast::<R>() {
+                    Ok(r) => Ok(r),
+                    Err(e) => {
+                        println!("got: {:?}", e);
+                        Err(RpcError::BadReplyType.into())
+                    },
+                })
+        })
+    }
+}
+
+pub(crate) struct BindAuthKey {
+    pub perm_key: AuthKey,
+    pub temp_key: AuthKey,
+    pub temp_key_duration: Duration,
+    pub salt: mtproto::FutureSalt,
+}
+
+impl Message for BindAuthKey {
+    type Result = Result<()>;
+}
+
+impl Handler<BindAuthKey> for RpcClientActor {
+    type Result = ResponseFuture<(), Error>;
+
+    fn handle(&mut self, bind: BindAuthKey, ctx: &mut Self::Context) -> Self::Result {
+        let BindAuthKey { perm_key, temp_key, temp_key_duration, salt } = bind;
+        self.session.adopt_key(temp_key);
+        self.session.add_server_salts(::std::iter::once(salt));
+        let addr: Addr<Unsync, Self> = ctx.address();
+        let bound = self.session.bind_auth_key(perm_key, temp_key_duration)
+            .map(|message| addr.send(SendMessage::<mtproto::Bool> {
+                builder: message.lift(),
+                _dummy: PhantomData,
+            }));
+        Box::new({
+            bound.into_future()
+                .and_then(|f| f.map_err(Into::into))
+                .and_then(|r| r)
+                .and_then(|reply| if reply.into() {
+                    Ok(())
+                } else {
+                    Err(format_err!("confusing Ok(false) from bind_auth_key").into())
+                })
+        })
+    }
+}
+
+struct Scan<'a, S>(&'a mut RpcClientActor, &'a mut Context<RpcClientActor>, S);
 
 macro_rules! scan_type_impl {
-    (@block_phase(($this:ident, $name:ident: $ty:ty) -> Future $block:block $($rin:tt)*) $($rout:tt)*) => {
+    (@block_phase(($self:ident, $ctx:ident, $name:ident: $ty:ty) $block:block $($rin:tt)*) $($rout:tt)*) => {
         impl<'a> Scan<'a, $ty> {
-            fn scan(self) -> BoxFuture<()> {
-                let Scan($this, $name) = self;
-                Box::new($block)
-            }
-        }
-
-        scan_type_impl! { @block_phase($($rin)*) @out($ty) $($rout)* }
-    };
-    (@block_phase(($this:ident, $name:ident: $ty:ty) -> Result $block:block $($rin:tt)*) $($rout:tt)*) => {
-        impl<'a> Scan<'a, $ty> {
-            fn scan(self) -> BoxFuture<()> {
-                let Scan($this, $name) = self;
-                Box::new(future::result((|| $block)()))
+            fn scan(self) -> Result<()> {
+                let Scan($self, $ctx, $name) = self;
+                $block
             }
         }
 
@@ -221,25 +226,25 @@ macro_rules! scan_type_impl {
 
     (@block_phase() $($rest:tt)*) => {
         impl RpcClientActor {
-            fn scan_replies(&mut self, mut obj: mtproto::TLObject) -> BoxFuture<()> {
-                scan_type_impl! { @obj(self, obj) $($rest)* }
+            fn scan_replies(&mut self, ctx: &mut Context<Self>, mut obj: mtproto::TLObject) -> Result<()> {
+                scan_type_impl! { @obj(self, ctx, obj) $($rest)* }
             }
         }
     };
 
-    (@obj($self:ident, $obj:ident) @out($ty:ty) $($rest:tt)*) => {
+    (@obj($self:ident, $ctx:ident, $obj:ident) @out($ty:ty) $($rest:tt)*) => {
         $obj = match $obj.downcast::<$ty>() {
-            Ok(d) => return Scan::<$ty>($self, d).scan(),
+            Ok(d) => return Scan::<$ty>($self, $ctx, d).scan(),
             Err(o) => o,
         };
-        scan_type_impl! { @obj($self, $obj) $($rest)* }
+        scan_type_impl! { @obj($self, $ctx, $obj) $($rest)* }
     };
 
-    (@obj($self:ident, $obj:ident)) => {
-        Box::new({
-            $self.delegate.call(Event::Unhandled($obj))
-                .map_err(|e| e.context(format_err!("sending Unhandled to the delegate")).into())
-        })
+    (@obj($self:ident, $ctx:ident, $obj:ident)) => {
+        if let Some(ref recipient) = $self.delegates.unhandled {
+            recipient.do_send(Unhandled($obj)).map_err(clear_send_error)?;
+        }
+        Ok(())
     };
 }
 
@@ -250,23 +255,21 @@ macro_rules! scan_type {
 }
 
 scan_type! {
-    (this, mc: mtproto::manual::MessageContainer) -> Future {
+    (this, ctx, mc: mtproto::manual::MessageContainer) {
         let mtproto::manual::MessageContainer::MsgContainer(mc) = mc;
-        let mut ret = stream::FuturesUnordered::new();
         for msg in mc.messages.0 {
             this.maybe_ack(Some(msg.seqno), msg.msg_id);
-            ret.push(this.scan_replies(msg.body.0));
+            this.scan_replies(ctx, msg.body.0)?;
         }
-        ret.for_each(|()| Ok(()))
+        Ok(())
     }
 
-    (this, rpc: mtproto::manual::RpcResult) -> Result {
+    (this, ctx, rpc: mtproto::manual::RpcResult) {
         let mtproto::manual::RpcResult::RpcResult(rpc) = rpc;
         let (_, replier) = match this.pending_rpcs.remove(&rpc.req_msg_id) {
             Some(t) => t,
             None => {
-                println!("no matching rpc for {:?}", rpc);
-                return Ok(())
+                return Err(format_err!("no matching rpc for {:?}", rpc));
             }
         };
         let result = match rpc.result.downcast::<mtproto::RpcError>() {
@@ -278,58 +281,41 @@ scan_type! {
     }
 }
 
-impl Actor for RpcClientActor {
-    type Request = InternalEvent;
-    type Response = ();
-    type Future = BoxFuture<()>;
-
-    fn call(&mut self, req: Self::Request) -> Self::Future {
-        self.process_sync(req)
-    }
-}
-
 fn one_cpupool() -> ::futures_cpupool::CpuPool {
     ::futures_cpupool::Builder::new()
         .pool_size(1)
         .create()
 }
 
-impl RpcClient {
-    pub fn spawn<E, S>(executor: &E, log: Logger, app_id: AppId, stream: S) -> Result<Self>
-        where E: future::Executor<Box<Future<Item = (), Error = ()>>>,
-              S: AsyncRead + AsyncWrite + 'static,
-    {
-        RpcClientActor::spawn(executor, log, app_id, stream)
-            .map(|actor_tx| RpcClient { actor_tx })
+fn clear_send_error<T>(err: SendError<T>) -> Error {
+    match err {
+        SendError::Full(_) => format_err!("inbox full"),
+        SendError::Closed(_) => format_err!("inbox closed"),
     }
+}
 
-    pub fn ask<M: ::clacks_mtproto::Function>(&self, query: M) -> impl FailureFuture<M::Reply> {
-        self.ask_inner::<M>(session::EitherMessageBuilder::encrypted(query))
-    }
+pub struct Unhandled(pub mtproto::TLObject);
+impl Message for Unhandled {
+    type Result = ();
+}
 
-    pub(crate) fn ask_plain<M: ::clacks_mtproto::Function>(&self, query: M) -> impl FailureFuture<M::Reply> {
-        self.ask_inner::<M>(session::EitherMessageBuilder::plain(query))
-    }
+#[derive(Default)]
+pub struct EventDelegates {
+    pub unhandled: Option<Recipient<Unsync, Unhandled>>,
+}
 
-    fn ask_inner<M: ::clacks_mtproto::Function>(&self, query: session::EitherMessageBuilder) -> impl FailureFuture<M::Reply> {
-        self.actor_tx.ask(InternalEvent::Outbound, query)
-                .and_then(|r| r)
-                .and_then(|obj| match obj.downcast::<M::Reply>() {
-                    Ok(r) => Ok(r),
-                    Err(b) => Err(RpcError::BadReplyType.into()),
-                })
-    }
+pub struct SetDelegates {
+    pub delegates: EventDelegates,
+}
 
-    pub fn set_delegate(&self, delegate: EventDelegate) -> impl FailureFuture<()> {
-        self.actor_tx.call(InternalEvent::SetDelegate(delegate))
-    }
+impl Message for SetDelegates {
+    type Result = ();
+}
 
-    pub fn new_auth_key(&self, temp_key_duration: Duration) -> impl FailureFuture<AuthKey> {
-        ::kex::kex(self.clone(), one_cpupool(), None)
-            .map(|(k, _)| k)
-    }
+impl Handler<SetDelegates> for RpcClientActor {
+    type Result = ();
 
-    pub(crate) fn call(&self, req: InternalEvent) -> impl FailureFuture<()> {
-        self.actor_tx.call(req)
+    fn handle(&mut self, delegates: SetDelegates, _: &mut Self::Context) {
+        self.delegates = delegates.delegates;
     }
 }

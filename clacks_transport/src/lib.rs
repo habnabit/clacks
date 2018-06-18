@@ -9,7 +9,7 @@ extern crate clacks_mtproto;
 extern crate either;
 extern crate rand;
 extern crate serde_json;
-extern crate tokio_io;
+extern crate tokio_codec;
 
 pub type Result<T> = ::std::result::Result<T, ::failure::Error>;
 

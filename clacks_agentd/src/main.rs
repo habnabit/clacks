@@ -1,9 +1,12 @@
 #![warn(unused_extern_crates)]
 #![feature(proc_macro, proc_macro_non_items, generators)]
 
+#[macro_use] extern crate delegate;
+#[macro_use] extern crate serde_derive;
 #[macro_use] extern crate slog;
-
+extern crate actix;
 extern crate byteorder;
+extern crate bytes;
 extern crate chrono;
 extern crate clacks_crypto;
 extern crate clacks_mtproto;
@@ -12,9 +15,8 @@ extern crate clacks_transport;
 extern crate failure;
 extern crate futures_await as futures;
 extern crate futures_cpupool;
-extern crate kabuki;
-extern crate kabuki_extras;
 extern crate rand;
+extern crate keyring;
 extern crate serde;
 extern crate serde_json;
 extern crate sexpr;
@@ -24,16 +26,22 @@ extern crate slog_scope;
 extern crate slog_term;
 extern crate tokio;
 extern crate tokio_io;
+extern crate tokio_uds;
 
+use actix::prelude::*;
 use byteorder::{BigEndian, ByteOrder, LittleEndian};
 use clacks_crypto::csrng_gen;
 use clacks_mtproto::{BoxedDeserialize, BoxedSerialize, IntoBoxed, mtproto};
 use futures::{Future, Sink, Stream, future};
 use futures::prelude::*;
-use kabuki_extras::ext_traits::*;
 use rand::Rng;
 use std::io;
 use tokio_io::{AsyncRead, AsyncWrite};
+
+mod real_shutdown;
+use real_shutdown::RealShutdown;
+
+mod secrets;
 
 
 struct ElispFormatter(sexpr::ser::CompactFormatter);
@@ -113,43 +121,41 @@ impl ElispFormatter {
 
 struct Delegate;
 
-impl kabuki::Actor for Delegate {
-    type Request = clacks_rpc::client::Event;
-    type Response = ();
-    type Future = BoxFuture<()>;
+impl Handler<clacks_rpc::client::Unhandled> for Delegate {
+    type Result = ();
 
-    fn call(&mut self, request: Self::Request) -> Self::Future {
-        use clacks_rpc::client::Event::*;
-        println!("event {:?}", request);
-        match request {
-            Unhandled(o) => {
-                println!("---sexpr---\n{}\n", ElispFormatter::to_string(&o).expect("not serialized"));
-                println!("---json---\n{}\n---", serde_json::to_string_pretty(&o).expect("not serialized"));
-            },
-            _ => (),
-        }
-        Box::new(future::ok(()))
+    fn handle(&mut self, unhandled: clacks_rpc::client::Unhandled, _: &mut Self::Context) {
+        println!("unhandled {:?}", unhandled.0);
+        println!("---sexpr---\n{}\n", ElispFormatter::to_string(&unhandled.0).expect("not serialized"));
+        println!("---json---\n{}\n---", serde_json::to_string_pretty(&unhandled.0).expect("not serialized"));
     }
 }
 
-fn kex(log: slog::Logger) -> impl FailureFuture<()> { async_block! {
-    let executor = tokio::executor::current_thread::TaskExecutor::current();
-    let socket: kabuki_extras::RealShutdown<tokio::net::TcpStream> = await!(
+impl Actor for Delegate {
+    type Context = Context<Self>;
+}
+
+fn kex(log: slog::Logger) -> impl Future<Item = (), Error = failure::Error> { async_block! {
+    let app_key = read_app_key()?;
+    let socket: RealShutdown<tokio::net::TcpStream> = await!(
         tokio::net::TcpStream::connect(&"149.154.167.50:443".parse().unwrap()))?.into();
-    let app_id = clacks_transport::session::AppId {
-        api_id: 0,
-        api_hash: "".into(),
-    };
-    let client = clacks_rpc::client::RpcClient::spawn(&executor, log, app_id, socket)?;
-    let delegate = kabuki::Builder::new().spawn(&executor, Delegate)?;
-    let () = await!(client.set_delegate(kabuki_extras::ErasedService::new_erased(delegate)))?;
+    let delegate: Addr<Unsync, _> = Delegate.start();
+    let app_id = app_key.as_app_id();
+    let client: Addr<Unsync, _> = clacks_rpc::client::RpcClientActor::create(|ctx| {
+        clacks_rpc::client::RpcClientActor::from_context(ctx, log, app_id, socket)
+    });
+    await!(client.send(clacks_rpc::client::SetDelegates {
+        delegates: clacks_rpc::client::EventDelegates {
+            unhandled: Some(delegate.recipient()),
+        },
+    }))?;
     let perm_key = await!(clacks_rpc::kex::new_auth_key(
         client.clone(), futures_cpupool::CpuPool::new(1), chrono::Duration::hours(24)))?;
     println!("perm_key: {:?}", perm_key);
     let init = mtproto::rpc::InvokeWithLayer {
         layer: mtproto::LAYER,
         query: mtproto::rpc::InitConnection {
-            api_id: 0,
+            api_id: app_key.api_id,
             device_model: "test".into(),
             system_version: "test".into(),
             app_version: "0.0.1".into(),
@@ -163,16 +169,32 @@ fn kex(log: slog::Logger) -> impl FailureFuture<()> { async_block! {
         allow_flashcall: false,
         phone_number: "".into(),
         current_number: None,
-        api_id: 0,
-        api_hash: "".to_string(),
+        api_id: app_key.api_id,
+        api_hash: app_key.api_hash.clone(),
     };
-    let answer = await!(client.ask(init))?;
+    let answer = await!(client.send(clacks_rpc::client::SendMessage::encrypted(init)))??;
     println!("answer: {:#?}", answer);
     println!("---sexpr---\n{}\n", ElispFormatter::to_string(&answer).expect("not serialized"));
     println!("---json---\n{}\n---", serde_json::to_string_pretty(&answer).expect("not serialized"));
-    let answer = await!(client.ask(send_code))?;
+    let answer = await!(client.send(clacks_rpc::client::SendMessage::encrypted(send_code)))??;
     Ok(())
 }}
+
+fn read_app_key() -> Result<secrets::AppKeyV1, failure::Error> {
+    let entry = secrets::Entry::new(secrets::AppKey);
+    entry.get()
+        .and_then(|opt| {
+            opt.map(Ok)
+                .unwrap_or_else(|| {
+                    let value = secrets::AppKeyV1 {
+                        api_id: 0,
+                        api_hash: "".to_string(),
+                    };
+                    entry.set(&value)?;
+                    Ok(value)
+                })
+        })
+}
 
 fn main() {
     use futures::{Future, Stream};
@@ -185,10 +207,10 @@ fn main() {
     let log = slog::Logger::root(drain, o!());
     let _scoped = slog_scope::set_global_logger(log.new(o!("subsystem" => "implicit logger")));
 
-    let mut runtime = tokio::runtime::current_thread::Runtime::new().unwrap();
-    runtime.spawn({
+    let system = System::new("actors");
+    system.handle().spawn({
         kex(log)
             .map_err(|e| panic!("fatal {:?}", e))
     });
-    runtime.run().unwrap();
+    system.run();
 }
