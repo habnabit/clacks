@@ -21,9 +21,6 @@ codecov = { repository = "actix/actix", branch = "master", service = "github" }
 name = "actix"
 path = "src/lib.rs"
 
-[workspace]
-members = ["examples/chat"]
-
 [features]
 default = ["signal", "resolver"]
 
@@ -62,8 +59,3 @@ tokio-signal = { version = "0.2", optional = true }
 
 # dns resolver
 trust-dns-resolver = { version = "0.9", optional = true }
-
-[profile.release]
-lto = true
-opt-level = 3
-codegen-units = 1

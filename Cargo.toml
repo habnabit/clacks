@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "actix",
     "clacks_agentd",
     "clacks_crypto",
     "clacks_demos",
