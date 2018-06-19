@@ -139,9 +139,9 @@ fn kex(log: slog::Logger) -> impl Future<Item = (), Error = failure::Error> { as
     let app_key = read_app_key()?;
     let socket: RealShutdown<tokio::net::TcpStream> = await!(
         tokio::net::TcpStream::connect(&"149.154.167.50:443".parse().unwrap()))?.into();
-    let delegate: Addr<Unsync, _> = Delegate.start();
+    let delegate = Delegate.start();
     let app_id = app_key.as_app_id();
-    let client: Addr<Unsync, _> = clacks_rpc::client::RpcClientActor::create(|ctx| {
+    let client = clacks_rpc::client::RpcClientActor::create(|ctx| {
         clacks_rpc::client::RpcClientActor::from_context(ctx, log, app_id, socket)
     });
     await!(client.send(clacks_rpc::client::SetDelegates {
@@ -207,10 +207,10 @@ fn main() {
     let log = slog::Logger::root(drain, o!());
     let _scoped = slog_scope::set_global_logger(log.new(o!("subsystem" => "implicit logger")));
 
-    let system = System::new("actors");
-    system.handle().spawn({
-        kex(log)
-            .map_err(|e| panic!("fatal {:?}", e))
+    System::run(|| {
+        Arbiter::spawn({
+            kex(log)
+                .map_err(|e| panic!("fatal {:?}", e))
+        });
     });
-    system.run();
 }

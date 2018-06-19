@@ -31,7 +31,7 @@ impl<E, F> future::Executor<F> for BoxExecutor<E>
     }
 }
 
-pub fn kex<E>(addr: Addr<Unsync, client::RpcClientActor>, pq_executor: E, expires_in: Option<Duration>)
+pub fn kex<E>(addr: Addr<client::RpcClientActor>, pq_executor: E, expires_in: Option<Duration>)
              -> impl Future<Item = (AuthKey, mtproto::FutureSalt), Error = Error>
     where E: future::Executor<Box<Future<Item = (), Error = ()> + Send>>
 { async_block! {
@@ -112,7 +112,7 @@ pub fn kex<E>(addr: Addr<Unsync, client::RpcClientActor>, pq_executor: E, expire
     Ok((auth_key, salt))
 }}
 
-pub fn new_auth_key<E>(addr: Addr<Unsync, client::RpcClientActor>, pq_executor: E, temp_key_duration: Duration) -> impl Future<Item = AuthKey, Error = Error>
+pub fn new_auth_key<E>(addr: Addr<client::RpcClientActor>, pq_executor: E, temp_key_duration: Duration) -> impl Future<Item = AuthKey, Error = Error>
     where E: future::Executor<Box<Future<Item = (), Error = ()> + Send>> + Clone
 { async_block! {
     let (temp_key, salt) = await!(kex(addr.clone(), pq_executor.clone(), Some(temp_key_duration)))?;

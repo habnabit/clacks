@@ -1,4 +1,4 @@
-use actix::{self, Actor, Addr, Arbiter, AsyncContext, Context, StreamHandler, Syn, System, Unsync};
+use actix::{self, Actor, Addr, Arbiter, AsyncContext, Context, StreamHandler, System};
 use actix::prelude::*;
 use chrono::{Duration, Utc};
 use clacks_crypto::symm::AuthKey;
@@ -77,7 +77,11 @@ impl actix::io::WriteHandler<io::Error> for RpcClientActor {
 }
 
 impl StreamHandler<Vec<u8>, io::Error> for RpcClientActor {
-    fn handle(&mut self, vec: Vec<u8>, ctx: &mut Self::Context) {
+    fn handle(&mut self, input: io::Result<Option<Vec<u8>>>, ctx: &mut Self::Context) {
+        let vec = match input {
+            Ok(Some(v)) => v,
+            e => return,
+        };
         let message = match self.session.process_message(&vec) {
             Ok(m) => m,
             Err(e) => return,
@@ -191,7 +195,7 @@ impl Handler<BindAuthKey> for RpcClientActor {
         let BindAuthKey { perm_key, temp_key, temp_key_duration, salt } = bind;
         self.session.adopt_key(temp_key);
         self.session.add_server_salts(::std::iter::once(salt));
-        let addr: Addr<Unsync, Self> = ctx.address();
+        let addr = ctx.address();
         let bound = self.session.bind_auth_key(perm_key, temp_key_duration)
             .map(|message| addr.send(SendMessage::<mtproto::Bool> {
                 builder: message.lift(),
@@ -301,7 +305,7 @@ impl Message for Unhandled {
 
 #[derive(Default)]
 pub struct EventDelegates {
-    pub unhandled: Option<Recipient<Unsync, Unhandled>>,
+    pub unhandled: Option<Recipient<Unhandled>>,
 }
 
 pub struct SetDelegates {

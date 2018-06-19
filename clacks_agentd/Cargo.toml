@@ -4,7 +4,6 @@ version = "0.0.1"
 authors = ["Aaron Gallagher <_@habnab.it>"]
 
 [dependencies]
-actix = "*"
 byteorder = "*"
 bytes = "*"
 chrono = "*"
@@ -26,6 +25,10 @@ slog-term = "*"
 tokio = "*"
 tokio-io = "*"
 tokio-uds = "*"
+
+[dependencies.actix]
+path = "../actix"
+version = "0.6.1"
 
 [dependencies.clacks_mtproto]
 path = "../clacks_mtproto"
