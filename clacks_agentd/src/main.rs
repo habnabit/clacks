@@ -2,6 +2,7 @@
 #![feature(proc_macro, proc_macro_non_items, generators)]
 
 #[macro_use] extern crate delegate;
+#[macro_use] extern crate jsonrpc_macros;
 #[macro_use] extern crate serde_derive;
 #[macro_use] extern crate slog;
 extern crate actix;
@@ -15,6 +16,7 @@ extern crate clacks_transport;
 extern crate failure;
 extern crate futures_await as futures;
 extern crate futures_cpupool;
+extern crate jsonrpc_core;
 extern crate rand;
 extern crate keyring;
 extern crate serde;
@@ -25,6 +27,7 @@ extern crate slog_envlogger;
 extern crate slog_scope;
 extern crate slog_term;
 extern crate tokio;
+extern crate tokio_codec;
 extern crate tokio_io;
 extern crate tokio_uds;
 
@@ -41,6 +44,8 @@ use tokio_io::{AsyncRead, AsyncWrite};
 mod real_shutdown;
 use real_shutdown::RealShutdown;
 
+mod agent_connection;
+mod jsonrpc_handler;
 mod secrets;
 
 
@@ -207,9 +212,24 @@ fn main() {
     let log = slog::Logger::root(drain, o!());
     let _scoped = slog_scope::set_global_logger(log.new(o!("subsystem" => "implicit logger")));
 
-    System::run(|| {
+    System::run(move || {
+        let jsonrpc = {
+            let log = log.new(o!("subsystem" => "jsonrpc handler"));
+            jsonrpc_handler::JsonRpcHandlerActor::new(log).start()
+        };
         Arbiter::spawn({
-            kex(log)
+            let log = log.clone();
+            tokio_uds::UnixListener::bind("socket")
+                .into_future()
+                .and_then(|l| l.incoming().for_each(move |conn| {
+                    let log = log.new(o!("connection" => format!("{:?}", conn)));
+                    let jsonrpc = jsonrpc.clone();
+                    info!(log, "spawning");
+                    let addr = agent_connection::AgentActor::create(|ctx| {
+                        agent_connection::AgentActor::from_context(ctx, log, conn, jsonrpc)
+                    });
+                    Ok(())
+                }))
                 .map_err(|e| panic!("fatal {:?}", e))
         });
     });
