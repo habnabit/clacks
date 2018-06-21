@@ -6,11 +6,11 @@ license = "MIT/Apache-2.0"
 description = "crypto-related functionality for telegram/mtproto"
 
 [dependencies]
-byteorder = "1.2"
-chrono = "*"
+byteorder = "1.2.3"
+chrono = "0.4.3"
 failure = "0.1.1"
-openssl = "0.10"
-rand = "0.4"
+openssl = "0.10.10"
+rand = "0.4.2"
 
 [dependencies.clacks_mtproto]
 path = "../clacks_mtproto"

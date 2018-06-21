@@ -6,16 +6,14 @@ license = "MIT/Apache-2.0"
 description = "telegram's TCP transport encoding"
 
 [dependencies]
-byteorder = "1.2"
-bytes = "0.4"
-chrono = "0.4"
-either = "*"
+byteorder = "1.2.3"
+bytes = "0.4.8"
+chrono = "0.4.3"
+either = "1.5.0"
 failure = "0.1.1"
-rand = "0.4"
-slog = "*"
-tokio-codec = "*"
-
-serde_json = "*"
+rand = "0.4.2"
+slog = "2.2.3"
+tokio-codec = "0.1.0"
 
 [dependencies.clacks_mtproto]
 path = "../clacks_mtproto"
