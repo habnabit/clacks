@@ -308,7 +308,6 @@ impl Session {
             .into_outbound_encrypted(
                 self.latest_server_salt()?, self.session_id,
                 |c| self.next_seq_no(c));
-        println!("---out---\n{}\n{:?}\n---", ::serde_json::to_string(&message).unwrap_or_default(), message);
         Ok(key.encrypt_message(message)?)
     }
 

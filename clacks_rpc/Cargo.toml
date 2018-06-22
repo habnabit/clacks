@@ -20,7 +20,7 @@ path = "../actix"
 version = "0.6.1"
 
 [dependencies.futures-await]
-version = "0.2.0-alpha"
+version = "0.1.0"
 optional = true
 
 [dependencies.clacks_crypto]

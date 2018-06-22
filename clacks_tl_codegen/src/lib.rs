@@ -4,10 +4,13 @@
 #[cfg(feature = "rustfmt-codegen")]
 extern crate rustfmt;
 
-#[macro_use] extern crate derivative;
 #[macro_use] extern crate quote;
+extern crate proc_macro2;
 extern crate pom;
 extern crate syn;
+
+use proc_macro2::TokenStream as Tokens;
+
 
 pub mod parser {
     use pom::char_class::{alphanum, digit, hex_digit};
@@ -89,7 +92,7 @@ pub mod parser {
         pub ty: Type,
     }
 
-    #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
     pub struct Constructor<Ty, Fi> {
         pub variant: Ty,
         pub tl_id: Option<u32>,
@@ -321,16 +324,21 @@ pub mod parser {
 
 use parser::{Constructor, Delimiter, Field, Item, Matched, NameChunks, Type};
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::mem;
 
-fn fail_hard() -> quote::Tokens {
+fn fail_hard() -> Tokens {
     quote!(FAIL_LOUDLY_AT_COMPILE_TIME!())
 }
 
-#[derive(Derivative)]
-#[derivative(Debug, Default(bound = ""))]
+#[derive(Debug)]
 struct Constructors<Ty, Fi>(Vec<Matched<Constructor<Ty, Fi>>>);
+
+impl<Ty, Fi> Default for Constructors<Ty, Fi> {
+    fn default() -> Self {
+        Constructors(Vec::new())
+    }
+}
 
 type TypeResolutionMap = BTreeMap<Vec<String>, TypeIR>;
 
@@ -346,7 +354,7 @@ enum NamespaceItem {
 struct Namespace(BTreeMap<syn::Ident, NamespaceItem>);
 
 impl NamespaceItem {
-    fn as_tokens(&self, name: &syn::Ident) -> quote::Tokens {
+    fn as_tokens(&self, name: &syn::Ident) -> Tokens {
         use self::NamespaceItem::*;
         match *self {
             AsEnum(ref cs) => cs.as_enum(),
@@ -383,7 +391,7 @@ impl Namespace {
         }
     }
 
-    fn as_tokens(&self) -> quote::Tokens {
+    fn as_tokens(&self) -> Tokens {
         let items = self.0.iter().map(|(name, item)| item.as_tokens(name));
         quote!(#( #items )*)
     }
@@ -478,7 +486,7 @@ impl AllConstructors {
         ret
     }
 
-    fn as_dynamic_deserializers(&self) -> quote::Tokens {
+    fn as_dynamic_deserializers(&self) -> Tokens {
         let mut all_constructors = Default::default();
         self.items.populate_all_constructors(&mut all_constructors);
         let dynamic_deserializer = all_constructors.iter()
@@ -499,7 +507,7 @@ impl AllConstructors {
         }
     }
 
-    fn as_tokens(&self) -> quote::Tokens {
+    fn as_tokens(&self) -> Tokens {
         let ns_tokens = self.items.as_tokens();
         let dynamic_deserializers = self.as_dynamic_deserializers();
         quote! {
@@ -523,12 +531,12 @@ fn no_conflict_ident(s: &str) -> syn::Ident {
 
 fn no_conflict_local_ident(s: &str) -> Option<syn::Ident> {
     match s {
-        "bytes" => Some("bytes_".into()),
+        "bytes" => Some(syn::parse_str("bytes_").unwrap()),
         _ => None,
     }
 }
 
-fn wrap_option_type(wrap: bool, ty: quote::Tokens) -> quote::Tokens {
+fn wrap_option_type(wrap: bool, ty: Tokens) -> Tokens {
     if wrap {
         quote! { Option<#ty> }
     } else {
@@ -536,7 +544,7 @@ fn wrap_option_type(wrap: bool, ty: quote::Tokens) -> quote::Tokens {
     }
 }
 
-fn wrap_option_value(wrap: bool, ty: quote::Tokens) -> quote::Tokens {
+fn wrap_option_value(wrap: bool, ty: Tokens) -> Tokens {
     if wrap {
         quote! { Some(#ty) }
     } else {
@@ -544,26 +552,46 @@ fn wrap_option_value(wrap: bool, ty: quote::Tokens) -> quote::Tokens {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Hash)]
+#[derive(Debug, Clone)]
 struct TypeName {
-    tokens: quote::Tokens,
+    tokens: Tokens,
+    tokens_canon: String,
     idents: Option<Vec<syn::Ident>>,
+}
+
+impl PartialEq for TypeName {
+    fn eq(&self, other: &Self) -> bool {
+        self.tokens_canon == other.tokens_canon
+    }
 }
 
 impl Eq for TypeName {}
 
+impl PartialOrd for TypeName {
+    fn partial_cmp(&self, other: &Self) -> Option<::std::cmp::Ordering> {
+        self.tokens_canon.partial_cmp(&other.tokens_canon)
+    }
+}
+
+impl Ord for TypeName {
+    fn cmp(&self, other: &Self) -> ::std::cmp::Ordering {
+        self.tokens_canon.cmp(&other.tokens_canon)
+    }
+}
+
 impl TypeName {
-    fn transformed_tokens<F>(&self, func: F) -> quote::Tokens
-        where F: FnOnce(&quote::Tokens) -> quote::Tokens,
+    fn transformed_tokens<F>(&self, func: F) -> Tokens
+        where F: FnOnce(&Tokens) -> Tokens,
     {
         func(&self.tokens)
     }
 
     fn transformed<F>(&self, func: F) -> Self
-        where F: FnOnce(&quote::Tokens) -> quote::Tokens,
+        where F: FnOnce(&Tokens) -> Tokens,
     {
         let tokens = self.transformed_tokens(func);
-        TypeName { tokens, idents: None }
+        let tokens_canon = format!("{}", tokens);
+        TypeName { tokens, tokens_canon, idents: None }
     }
 }
 
@@ -580,11 +608,12 @@ impl<S> ::std::iter::FromIterator<S> for TypeName
             tokens = quote!(#tokens::#segment);
             idents.push(segment);
         }
-        TypeName { tokens, idents: Some(idents) }
+        let tokens_canon = format!("{}", tokens);
+        TypeName { tokens, tokens_canon, idents: Some(idents) }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum WireKind {
     Bare(TypeName),
     Boxed(TypeName),
@@ -641,7 +670,7 @@ impl WireKind {
         *ty_loc = ty_loc.transformed(|ty| quote!(#ty<#contained>));
     }
 
-    fn as_read_method(&self) -> quote::Tokens {
+    fn as_read_method(&self) -> Tokens {
         use self::WireKind::*;
         match *self {
             Bare(..) | Flags => quote!(read_bare),
@@ -651,7 +680,7 @@ impl WireKind {
         }
     }
 
-    fn as_write_method(&self) -> Option<quote::Tokens> {
+    fn as_write_method(&self) -> Option<Tokens> {
         use self::WireKind::*;
         match *self {
             Bare(..) | Flags => Some(quote!(write_bare)),
@@ -704,7 +733,7 @@ impl WireKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct TypeIR {
     wire_kind: WireKind,
     needs_box: bool,
@@ -783,7 +812,7 @@ impl TypeIR {
         self
     }
 
-    fn io_turbofish(&self) -> quote::Tokens {
+    fn io_turbofish(&self) -> Tokens {
         use self::WireKind::*;
         let mut ty = match self.wire_kind {
             Flags => quote!(::mtproto::Flags),
@@ -795,20 +824,20 @@ impl TypeIR {
         quote!(::<#ty>)
     }
 
-    fn assemble_method(&self, method: quote::Tokens) -> quote::Tokens {
+    fn assemble_method(&self, method: Tokens) -> Tokens {
         let turbofish = self.io_turbofish();
         quote!(#method #turbofish)
     }
 
-    fn as_read_method(&self) -> quote::Tokens {
+    fn as_read_method(&self) -> Tokens {
         self.assemble_method(self.wire_kind.as_read_method())
     }
 
-    fn as_write_method(&self) -> Option<quote::Tokens> {
+    fn as_write_method(&self) -> Option<Tokens> {
         self.wire_kind.as_write_method().map(|m| self.assemble_method(m))
     }
 
-    fn non_field_type(&self) -> quote::Tokens {
+    fn non_field_type(&self) -> Tokens {
         use self::WireKind::*;
         match self.wire_kind {
             Bare(ref t) |
@@ -819,11 +848,11 @@ impl TypeIR {
         }
     }
 
-    fn unboxed(&self) -> quote::Tokens {
+    fn unboxed(&self) -> Tokens {
         wrap_option_type(self.with_option, self.non_field_type())
     }
 
-    fn boxed(&self) -> quote::Tokens {
+    fn boxed(&self) -> Tokens {
         let mut ty = self.non_field_type();
         if self.needs_box {
             ty = quote!(Box<#ty>);
@@ -831,7 +860,7 @@ impl TypeIR {
         wrap_option_type(self.with_option, ty)
     }
 
-    fn field_type(&self) -> quote::Tokens {
+    fn field_type(&self) -> Tokens {
         if self.is_unit() {
             quote!(bool)
         } else {
@@ -839,19 +868,19 @@ impl TypeIR {
         }
     }
 
-    fn ref_prefix(&self) -> quote::Tokens {
+    fn ref_prefix(&self) -> Tokens {
         if self.is_unit() {quote!()} else {quote!(ref)}
     }
 
-    fn reference_prefix(&self) -> quote::Tokens {
+    fn reference_prefix(&self) -> Tokens {
         if self.is_unit() {quote!()} else {quote!(&)}
     }
 
-    fn local_reference_prefix(&self) -> quote::Tokens {
+    fn local_reference_prefix(&self) -> Tokens {
         if self.is_unit() {quote!(&)} else {quote!()}
     }
 
-    fn field_reference_type(&self) -> quote::Tokens {
+    fn field_reference_type(&self) -> Tokens {
         let ref_ = self.reference_prefix();
         let ty = if self.is_unit() {
             quote!(bool)
@@ -861,7 +890,7 @@ impl TypeIR {
         wrap_option_type(self.with_option, quote!(#ref_ #ty))
     }
 
-    fn as_field_reference(&self, on: quote::Tokens) -> quote::Tokens {
+    fn as_field_reference(&self, on: Tokens) -> Tokens {
         if self.is_unit() {
             wrap_option_value(self.with_option, quote!(#on))
         } else if self.with_option {
@@ -871,7 +900,7 @@ impl TypeIR {
         }
     }
 
-    fn is_defined_trailer(&self) -> quote::Tokens {
+    fn is_defined_trailer(&self) -> Tokens {
         use self::WireKind::*;
         match self.wire_kind {
             _ if self.with_option => quote!(.is_some()),
@@ -912,7 +941,7 @@ impl TypeIR {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct FieldIR {
     name: String,
     ty: TypeIR,
@@ -941,7 +970,7 @@ impl FieldIR {
         no_conflict_local_ident(&self.name)
     }
 
-    fn as_field(&self) -> quote::Tokens {
+    fn as_field(&self) -> Tokens {
         let name = self.name();
         let ty = self.ty.field_type();
 
@@ -1058,7 +1087,7 @@ impl Constructor<Type, Field> {
 }
 
 impl Constructor<TypeIR, FieldIR> {
-    fn fields_tokens(&self, pub_: quote::Tokens, trailer: quote::Tokens) -> quote::Tokens {
+    fn fields_tokens(&self, pub_: Tokens, trailer: Tokens) -> Tokens {
         let pub_ = std::iter::repeat(pub_);
         if self.fields.is_empty() {
             quote! { #trailer }
@@ -1072,7 +1101,7 @@ impl Constructor<TypeIR, FieldIR> {
         }
     }
 
-    fn generics(&self) -> quote::Tokens {
+    fn generics(&self) -> Tokens {
         if self.type_parameters.is_empty() {
             return quote!();
         }
@@ -1080,11 +1109,11 @@ impl Constructor<TypeIR, FieldIR> {
         quote! { <#(#tys),*> }
     }
 
-    fn rpc_generics(&self) -> quote::Tokens {
+    fn rpc_generics(&self) -> Tokens {
         self.type_generics(&quote!(::Function))
     }
 
-    fn type_generics(&self, trait_: &quote::Tokens) -> quote::Tokens {
+    fn type_generics(&self, trait_: &Tokens) -> Tokens {
         if self.type_parameters.is_empty() {
             return quote!();
         }
@@ -1093,7 +1122,7 @@ impl Constructor<TypeIR, FieldIR> {
         quote! { <#(#tys: #traits),*> }
     }
 
-    fn serialize_generics(&self) -> quote::Tokens {
+    fn serialize_generics(&self) -> Tokens {
         if self.type_parameters.is_empty() {
             return quote!();
         }
@@ -1101,7 +1130,7 @@ impl Constructor<TypeIR, FieldIR> {
         quote! { <#(#tys: ::AnyBoxedSerialize),*> }
     }
 
-    fn as_struct_determine_flags(&self, field_prefix: quote::Tokens) -> Option<quote::Tokens> {
+    fn as_struct_determine_flags(&self, field_prefix: Tokens) -> Option<Tokens> {
         match self.fields.iter().filter(|f| f.ty.is_flags()).count() {
             0 => return None,
             1 => (),
@@ -1132,7 +1161,7 @@ impl Constructor<TypeIR, FieldIR> {
         format!("TL-derived from `{}`\n\n```text\n{}\n```\n", self.original_variant, matched)
     }
 
-    fn as_struct_base(&self, name: &syn::Ident, matched: &str) -> quote::Tokens {
+    fn as_struct_base(&self, name: &syn::Ident, matched: &str) -> Tokens {
         let doc = self.as_struct_doc(matched);
         let generics = self.generics();
         let fields = self.fields_tokens(quote! {pub}, quote! {;});
@@ -1143,7 +1172,7 @@ impl Constructor<TypeIR, FieldIR> {
         }
     }
 
-    fn as_struct_deserialize(&self) -> (bool, quote::Tokens) {
+    fn as_struct_deserialize(&self) -> (bool, Tokens) {
         if self.fields.is_empty() {
             return (false, quote!());
         }
@@ -1188,7 +1217,7 @@ impl Constructor<TypeIR, FieldIR> {
         (has_flags, constructor)
     }
 
-    fn as_into_boxed(&self, name: &syn::Ident) -> Option<quote::Tokens> {
+    fn as_into_boxed(&self, name: &syn::Ident) -> Option<Tokens> {
         if self.tl_id().is_none() {
             return None;
         }
@@ -1204,7 +1233,7 @@ impl Constructor<TypeIR, FieldIR> {
         })
     }
 
-    fn as_type_struct_base(&self, name: syn::Ident, matched: &str) -> quote::Tokens {
+    fn as_type_struct_base(&self, name: syn::Ident, matched: &str) -> Tokens {
         let serialize_destructure = self.as_variant_ref_destructure(&name)
             .map(|d| quote! { let &#d = self; })
             .unwrap_or_else(|| quote!());
@@ -1235,7 +1264,7 @@ impl Constructor<TypeIR, FieldIR> {
         self.variant.name()
     }
 
-    fn as_variant_type_struct(&self, matched: &str) -> quote::Tokens {
+    fn as_variant_type_struct(&self, matched: &str) -> Tokens {
         if self.fields.is_empty() {
             quote!()
         } else {
@@ -1243,7 +1272,7 @@ impl Constructor<TypeIR, FieldIR> {
         }
     }
 
-    fn as_variant_ref_destructure(&self, name: &syn::Ident) -> Option<quote::Tokens> {
+    fn as_variant_ref_destructure(&self, name: &syn::Ident) -> Option<Tokens> {
         if self.fields.is_empty() {
             return None;
         }
@@ -1266,7 +1295,7 @@ impl Constructor<TypeIR, FieldIR> {
         })
     }
 
-    fn as_variant_serialize(&self) -> quote::Tokens {
+    fn as_variant_serialize(&self) -> Tokens {
         let determine_flags = self.as_struct_determine_flags(quote!())
             .unwrap_or_else(|| quote!());
         let fields = self.fields.iter()
@@ -1302,7 +1331,7 @@ impl Constructor<TypeIR, FieldIR> {
         }
     }
 
-    fn as_function_struct(&self, matched: &str) -> quote::Tokens {
+    fn as_function_struct(&self, matched: &str) -> Tokens {
         let name = self.variant_name();
         let tl_id = self.tl_id().unwrap();
         let rpc_generics = self.rpc_generics();
@@ -1339,7 +1368,7 @@ impl Constructor<TypeIR, FieldIR> {
         }
     }
 
-    fn as_variant(&self) -> quote::Tokens {
+    fn as_variant(&self) -> Tokens {
         let name = self.variant_name();
         if self.fields.is_empty() {
             quote!(#name)
@@ -1349,7 +1378,7 @@ impl Constructor<TypeIR, FieldIR> {
         }
     }
 
-    fn as_variant_serialize_arm(&self) -> quote::Tokens {
+    fn as_variant_serialize_arm(&self) -> Tokens {
         let tl_id = self.tl_id().unwrap();
         if self.fields.is_empty() {
             quote!(=> (#tl_id, &()))
@@ -1358,7 +1387,7 @@ impl Constructor<TypeIR, FieldIR> {
         }
     }
 
-    fn as_variant_deserialize(&self) -> quote::Tokens {
+    fn as_variant_deserialize(&self) -> Tokens {
         if self.fields.is_empty() {
             quote!()
         } else {
@@ -1367,14 +1396,14 @@ impl Constructor<TypeIR, FieldIR> {
         }
     }
 
-    fn tl_id(&self) -> Option<quote::Tokens> {
+    fn tl_id(&self) -> Option<Tokens> {
         self.tl_id.as_ref().map(|tl_id| {
             let tl_id: syn::LitInt = syn::parse_str(&format!("0x{:08x}", tl_id)).unwrap();
             quote!(::ConstructorNumber(#tl_id))
         })
     }
 
-    fn as_type_impl(&self, name: &syn::Ident, serialize: quote::Tokens, deserialize: Option<quote::Tokens>) -> quote::Tokens {
+    fn as_type_impl(&self, name: &syn::Ident, serialize: Tokens, deserialize: Option<Tokens>) -> Tokens {
         let serialize_generics = self.serialize_generics();
         let generics = self.generics();
 
@@ -1465,8 +1494,8 @@ impl Constructors<Type, Field> {
 }
 
 impl Constructors<TypeIR, FieldIR> {
-    fn coalesce_methods(&self) -> BTreeMap<&str, HashMap<&TypeIR, HashSet<&Constructor<TypeIR, FieldIR>>>> {
-        let mut map: BTreeMap<&str, HashMap<&TypeIR, HashSet<&Constructor<TypeIR, FieldIR>>>> = BTreeMap::new();
+    fn coalesce_methods(&self) -> BTreeMap<&str, BTreeMap<&TypeIR, BTreeSet<&Constructor<TypeIR, FieldIR>>>> {
+        let mut map: BTreeMap<&str, BTreeMap<&TypeIR, BTreeSet<&Constructor<TypeIR, FieldIR>>>> = BTreeMap::new();
         for &Matched(ref cons, _) in &self.0 {
             for field in &cons.fields {
                 if field.ty.is_flags() {
@@ -1482,7 +1511,7 @@ impl Constructors<TypeIR, FieldIR> {
         map
     }
 
-    fn determine_methods(&self, enum_name: &syn::Ident) -> quote::Tokens {
+    fn determine_methods(&self, enum_name: &syn::Ident) -> Tokens {
         let all_constructors = self.0.len();
         let mut methods = vec![];
         for (name, typemap) in self.coalesce_methods() {
@@ -1529,7 +1558,7 @@ impl Constructors<TypeIR, FieldIR> {
         }
     }
 
-    fn as_type_impl(&self, name: &syn::Ident, serialize: quote::Tokens, deserialize: quote::Tokens) -> quote::Tokens {
+    fn as_type_impl(&self, name: &syn::Ident, serialize: Tokens, deserialize: Tokens) -> Tokens {
         let tl_ids = self.as_tl_ids();
 
         quote! {
@@ -1550,7 +1579,7 @@ impl Constructors<TypeIR, FieldIR> {
         }
     }
 
-    fn as_option_type_impl(&self) -> quote::Tokens {
+    fn as_option_type_impl(&self) -> Tokens {
         if self.0.len() != 2 {
             return quote!();
         }
@@ -1589,13 +1618,13 @@ impl Constructors<TypeIR, FieldIR> {
         }
     }
 
-    fn constructors_and_tl_ids<'this>(&'this self) -> Box<'this + Iterator<Item = (quote::Tokens, &'this Constructor<TypeIR, FieldIR>)>> {
+    fn constructors_and_tl_ids<'this>(&'this self) -> Box<'this + Iterator<Item = (Tokens, &'this Constructor<TypeIR, FieldIR>)>> {
         Box::new(self.0.iter().filter_map(|cm| {
             cm.0.tl_id().map(|id| (id, &cm.0))
         }))
     }
 
-    fn as_serialize_match(&self, enum_name: &syn::Ident) -> quote::Tokens {
+    fn as_serialize_match(&self, enum_name: &syn::Ident) -> Tokens {
         let constructors = self.0.iter()
             .map(|&Matched(ref c, _)| {
                 let variant_name = c.variant_name();
@@ -1609,13 +1638,13 @@ impl Constructors<TypeIR, FieldIR> {
         }
     }
 
-    fn as_tl_ids(&self) -> quote::Tokens {
+    fn as_tl_ids(&self) -> Tokens {
         let tl_ids = self.0.iter()
             .filter_map(|cm| cm.0.tl_id());
         quote!(#( #tl_ids, )*)
     }
 
-    fn as_dynamic_deserializer(&self) -> quote::Tokens {
+    fn as_dynamic_deserializer(&self) -> Tokens {
         let constructors = self.constructors_and_tl_ids()
             .map(|(tl_id, c)| {
                 let ty = if &c.original_variant == "manual.gzip_packed" {
@@ -1630,7 +1659,7 @@ impl Constructors<TypeIR, FieldIR> {
         }
     }
 
-    fn as_deserialize_match(&self, enum_name: &syn::Ident) -> quote::Tokens {
+    fn as_deserialize_match(&self, enum_name: &syn::Ident) -> Tokens {
         let constructors = self.constructors_and_tl_ids()
             .map(|(tl_id, c)| {
                 let variant_name = c.variant_name();
@@ -1658,7 +1687,7 @@ impl Constructors<TypeIR, FieldIR> {
         ret
     }
 
-    fn as_enum(&self) -> quote::Tokens {
+    fn as_enum(&self) -> Tokens {
         if self.0.iter().all(|cm| cm.0.tl_id().is_none()) {
             return quote!();
         }
