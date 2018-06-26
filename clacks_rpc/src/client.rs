@@ -45,7 +45,7 @@ impl RpcClientActor {
     {
         let session = Session::new(app_id);
         let (tg_rx, tg_tx) = stream.split();
-        let tg_rx = ctx.add_stream(tokio_codec::FramedRead::new(tg_rx, TelegramCodec::new()));
+        let tg_rx = ctx.add_stream2(tokio_codec::FramedRead::new(tg_rx, TelegramCodec::new()));
         let tg_tx: Box<tokio_io::AsyncWrite> = Box::new(tg_tx);
         let tg_tx = actix::io::FramedWrite::new(tg_tx, TelegramCodec::new(), ctx);
         RpcClientActor {
@@ -81,7 +81,7 @@ impl actix::io::WriteHandler<io::Error> for RpcClientActor {
 
 }
 
-impl StreamHandler<Vec<u8>, io::Error> for RpcClientActor {
+impl StreamHandler2<Vec<u8>, io::Error> for RpcClientActor {
     fn handle(&mut self, input: io::Result<Option<Vec<u8>>>, ctx: &mut Self::Context) {
         let vec = match input {
             Ok(Some(v)) => v,

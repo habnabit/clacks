@@ -71,8 +71,9 @@ impl Handler<Connect> for TelegramManagerActor {
             let app_id = app_id_res?;
             let socket: ::real_shutdown::RealShutdown<::tokio::net::TcpStream> = await!(
                 ::tokio::net::TcpStream::connect(&"149.154.167.50:443".parse().unwrap()))?.into();
-            let client = RpcClientActor::create(|ctx| {
-                RpcClientActor::from_context(ctx, log, app_id.clone(), socket)
+            let client = RpcClientActor::create({
+                let app_id = app_id.clone();
+                move |ctx| RpcClientActor::from_context(ctx, log, app_id, socket)
             });
             let delegate = Delegate.start();
             await!(client.send(client::SetDelegates {
@@ -98,7 +99,7 @@ impl Handler<Connect> for TelegramManagerActor {
             let init = mtproto::rpc::InvokeWithLayer {
                 layer: mtproto::LAYER,
                 query: mtproto::rpc::InitConnection {
-                    api_id: app_key.api_id,
+                    api_id: app_id.api_id,
                     device_model: "test".into(),
                     system_version: "test".into(),
                     app_version: "0.0.1".into(),
@@ -111,7 +112,7 @@ impl Handler<Connect> for TelegramManagerActor {
             let config = await!(client.send(client::CallFunction::encrypted(init)))??;
             Ok((UserDc {
                 phone_number: req.phone_number,
-                dc: config.this_dc,
+                dc: *config.this_dc(),
                 primary: true,
             }, client))
         }.into_actor(self).then(|r: Result<_, Error>, this, _ctx| {

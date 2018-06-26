@@ -21,7 +21,7 @@ impl AgentActor {
         where S: tokio_io::AsyncRead + tokio_io::AsyncWrite + 'static,
     {
         let (rx, tx) = stream.split();
-        let rx = ctx.add_stream(FramedRead::new(rx, LinesCodec::new()));
+        let rx = ctx.add_stream2(FramedRead::new(rx, LinesCodec::new()));
         let tx: Box<tokio_io::AsyncWrite> = Box::new(tx);
         let tx = Some(actix::io::FramedWrite::new(tx, LinesCodec::new(), ctx));
         AgentActor {
@@ -38,7 +38,7 @@ impl actix::io::WriteHandler<io::Error> for AgentActor {
 
 }
 
-impl StreamHandler<String, io::Error> for AgentActor {
+impl StreamHandler2<String, io::Error> for AgentActor {
     fn handle(&mut self, input: io::Result<Option<String>>, ctx: &mut Self::Context) {
         let input = match input {
             Ok(Some(s)) => Ok(s),
