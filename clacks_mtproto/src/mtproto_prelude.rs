@@ -1,6 +1,6 @@
 #![allow(non_camel_case_types)]
 
-use ::{AnyBoxedSerialize, BareDeserialize, BareSerialize, BoxedDeserialize, BoxedSerialize, ConstructorNumber, Deserializer, Result, Serializer};
+use ::{AnyBoxedSerialize, BareDeserialize, BareSerialize, BoxedDeserialize, BoxedSerialize, ConstructorNumber, Deserializer, DynamicDeserializer, Result, Serializer};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use extfmt::Hexlify;
 use rand::{Rand, Rng};
@@ -35,14 +35,6 @@ macro_rules! impl_byteslike {
             fn deref_mut(&mut self) -> &mut [u8] { &mut self.0 }
         }
 
-        impl serde::Serialize for $ty {
-            fn serialize<S>(&self, serializer: S) -> ::std::result::Result<S::Ok, S::Error>
-                where S: serde::Serializer,
-            {
-                serializer.serialize_bytes(&self.0)
-            }
-        }
-
     };
 
     (@arraylike $ty:ident) => {
@@ -75,7 +67,7 @@ macro_rules! impl_byteslike {
     };
 }
 
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct bytes(pub Vec<u8>);
 
 impl BareDeserialize for bytes {
@@ -97,10 +89,10 @@ impl From<Vec<u8>> for bytes {
     }
 }
 
-#[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct int128(pub [u8; 16]);
 
-#[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct int256(pub [u8; 32]);
 
 impl_byteslike!(@common bytes);
@@ -155,14 +147,93 @@ impl fmt::Debug for TLObject {
 
 impl BoxedDeserialize for TLObject {
     fn possible_constructors() -> Vec<ConstructorNumber> {
-        ::mtproto::DYNAMIC_DESERIALIZERS.keys().cloned().collect()
+        ::mtproto::dynamic::BY_NUMBER.keys().cloned().collect()
     }
 
     fn deserialize_boxed(id: ConstructorNumber, de: &mut Deserializer) -> Result<Self> {
-        match ::mtproto::DYNAMIC_DESERIALIZERS.get(&id) {
-            Some(f) => f(id, de),
+        match ::mtproto::dynamic::BY_NUMBER.get(&id) {
+            Some(dyn) => (dyn.mtproto)(id, de),
             None => _invalid_id!(id),
         }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for TLObject {
+    fn deserialize<D>(deserializer: D) -> ::std::result::Result<Self, D::Error>
+        where D: serde::Deserializer<'de>,
+    {
+        struct Constructor(DynamicDeserializer);
+        struct DynVisitor;
+        struct Visitor;
+
+        impl<'de> serde::Deserialize<'de> for Constructor {
+            fn deserialize<D>(deserializer: D) -> ::std::result::Result<Self, D::Error>
+                where D: serde::Deserializer<'de>,
+            {
+                deserializer.deserialize_identifier(DynVisitor)
+            }
+        }
+
+        impl<'de> serde::de::DeserializeSeed<'de> for Constructor {
+            type Value = TLObject;
+
+            fn deserialize<D>(self, deserializer: D) -> ::std::result::Result<Self::Value, D::Error>
+                where D: serde::Deserializer<'de>,
+            {
+                (self.0.serde)(&mut ::erased_serde::Deserializer::erase(deserializer))
+                    .map_err(<D::Error as serde::de::Error>::custom)
+            }
+        }
+
+        impl<'de> serde::de::Visitor<'de> for DynVisitor {
+            type Value = Constructor;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                write!(formatter, "a dynamic deserializer")
+            }
+
+            fn visit_i64<E>(self, v: i64) -> ::std::result::Result<Self::Value, E>
+                where E: serde::de::Error,
+            {
+                self.visit_u64(v as u64)
+            }
+
+            fn visit_u64<E>(self, v: u64) -> ::std::result::Result<Self::Value, E>
+                where E: serde::de::Error,
+            {
+                let id = ConstructorNumber(v as u32);
+                ::mtproto::dynamic::BY_NUMBER
+                    .get(&id)
+                    .map(|&dyn| Constructor(dyn))
+                    .ok_or_else(|| E::invalid_value(serde::de::Unexpected::Unsigned(v), &self))
+            }
+
+            fn visit_str<E>(self, v: &str) -> ::std::result::Result<Self::Value, E>
+                where E: serde::de::Error,
+            {
+                ::mtproto::dynamic::BY_NAME
+                    .get(&v)
+                    .map(|&dyn| Constructor(dyn))
+                    .ok_or_else(|| E::invalid_value(serde::de::Unexpected::Str(v), &self))
+            }
+        }
+
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = TLObject;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                write!(formatter, "a TLObject variant")
+            }
+
+            fn visit_enum<A>(self, data: A) -> ::std::result::Result<Self::Value, A::Error>
+                where A: serde::de::EnumAccess<'de>,
+            {
+                let (cons, variant): (Constructor, _) = serde::de::EnumAccess::variant(data)?;
+                serde::de::VariantAccess::newtype_variant_seed(variant, cons)
+            }
+        }
+
+        deserializer.deserialize_enum("TLObject", &[], Visitor)
     }
 }
 
@@ -176,7 +247,11 @@ impl serde::Serialize for TLObject {
     fn serialize<S>(&self, serializer: S) -> ::std::result::Result<S::Ok, S::Error>
         where S: serde::Serializer,
     {
-        serde::Serialize::serialize(&self.0, serializer)
+        let (id, _) = self.0.serialize_boxed();
+        let tl_type_name = ::mtproto::dynamic::BY_NUMBER.get(&id)
+            .map(|dyn| dyn.type_name)
+            .unwrap_or(&"<bogus>");
+        serializer.serialize_newtype_variant("TLObject", id.0, tl_type_name, &self.0)
     }
 }
 
@@ -220,7 +295,15 @@ impl serde::Serialize for TransparentGunzip {
     }
 }
 
-#[derive(Debug, Clone)]
+impl<'de> serde::Deserialize<'de> for TransparentGunzip {
+    fn deserialize<D>(deserializer: D) -> ::std::result::Result<Self, D::Error>
+        where D: serde::Deserializer<'de>,
+    {
+        unimplemented!()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LengthPrefixed<T>(pub T);
 
 impl<T> From<T> for LengthPrefixed<T> {
@@ -248,16 +331,6 @@ impl<T> BareSerialize for LengthPrefixed<T>
         ser.write_i32::<LittleEndian>(inner.len() as i32)?;
         ser.write(&inner)?;
         Ok(())
-    }
-}
-
-impl<T> serde::Serialize for LengthPrefixed<T>
-    where T: serde::Serialize,
-{
-    fn serialize<S>(&self, serializer: S) -> ::std::result::Result<S::Ok, S::Error>
-        where S: serde::Serializer,
-    {
-        serde::Serialize::serialize(&self.0, serializer)
     }
 }
 
@@ -378,6 +451,16 @@ impl<Det, T> serde::Serialize for Vector<Det, T>
             seq.serialize_element(item)?;
         }
         seq.end()
+    }
+}
+
+impl<'de, Det, T> serde::Deserialize<'de> for Vector<Det, T>
+    where T: serde::Deserialize<'de>,
+{
+    fn deserialize<D>(deserializer: D) -> ::std::result::Result<Self, D::Error>
+        where D: serde::Deserializer<'de>,
+    {
+        Ok(Vector(serde::Deserialize::deserialize(deserializer)?, PhantomData))
     }
 }
 

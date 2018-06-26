@@ -22,7 +22,7 @@ mod mtproto_prelude;
 use std::{fmt, io};
 use std::any::Any;
 
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ConstructorNumber(pub u32);
 
 impl fmt::Debug for ConstructorNumber {
@@ -95,19 +95,41 @@ pub trait BoxedDeserialize
     }
 }
 
-pub trait BoxedDeserializeDynamic: BoxedDeserialize {
+pub trait BoxedDeserializeDynamic: BoxedDeserialize + for<'de> serde::Deserialize<'de> {
     fn boxed_deserialize_to_box(id: ConstructorNumber, de: &mut Deserializer) -> Result<mtproto::TLObject>;
+    fn serde_deserialize_to_box(de: &mut erased_serde::Deserializer) -> ::std::result::Result<mtproto::TLObject, erased_serde::Error>;
 }
 
 impl<D> BoxedDeserializeDynamic for D
-    where D: BoxedDeserialize + AnyBoxedSerialize,
+    where D: BoxedDeserialize + for<'de> serde::Deserialize<'de> + AnyBoxedSerialize,
 {
     fn boxed_deserialize_to_box(id: ConstructorNumber, de: &mut Deserializer) -> Result<mtproto::TLObject> {
         Ok(mtproto::TLObject::new(D::deserialize_boxed(id, de)?))
     }
+
+    fn serde_deserialize_to_box(de: &mut erased_serde::Deserializer) -> ::std::result::Result<mtproto::TLObject, erased_serde::Error>
+    {
+        Ok(mtproto::TLObject::new(erased_serde::deserialize::<D>(de)?))
+    }
 }
 
-pub type DynamicDeserializer = fn(ConstructorNumber, &mut Deserializer) -> Result<mtproto::TLObject>;
+#[derive(Clone, Copy)]
+pub struct DynamicDeserializer {
+    id: ConstructorNumber,
+    type_name: &'static str,
+    mtproto: fn(ConstructorNumber, &mut Deserializer) -> Result<mtproto::TLObject>,
+    serde: fn(&mut erased_serde::Deserializer) -> ::std::result::Result<mtproto::TLObject, erased_serde::Error>,
+}
+
+impl DynamicDeserializer {
+    pub fn from<D: BoxedDeserializeDynamic>(id: ConstructorNumber, type_name: &'static str) -> Self {
+        DynamicDeserializer {
+            id, type_name,
+            mtproto: D::boxed_deserialize_to_box,
+            serde: D::serde_deserialize_to_box,
+        }
+    }
+}
 
 pub struct Serializer<'w> {
     writer: &'w mut io::Write,

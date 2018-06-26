@@ -36,7 +36,7 @@ pub fn kex<E>(addr: Addr<client::RpcClientActor>, pq_executor: E, expires_in: Op
     where E: future::Executor<Box<Future<Item = (), Error = ()> + Send>>
 { async_block! {
     let nonce = csrng_gen();
-    let mtproto::ResPQ::ResPQ(pq) = await!(addr.send(client::SendMessage::plain(mtproto::rpc::ReqPq { nonce })))??;
+    let mtproto::ResPQ::ResPQ(pq) = await!(addr.send(client::CallFunction::plain(mtproto::rpc::ReqPq { nonce })))??;
     assert_eq!(nonce, pq.nonce);
     let server_nonce = pq.server_nonce;
     let pq_future: oneshot::SpawnHandle<(mtproto::bytes, mtproto::bytes), ::failure::Error> = oneshot::spawn_fn({
@@ -70,7 +70,7 @@ pub fn kex<E>(addr: Addr<client::RpcClientActor>, pq_executor: E, expires_in: Op
         };
         let aes = clacks_crypto::symm::AesParams::from_pq_inner_data(&inner)?;
         let encrypted_data = pubkey.encrypt(&inner.boxed_serialized_bytes()?)?.into();
-        let dh_params = await!(addr.send(client::SendMessage::plain(mtproto::rpc::ReqDHParams {
+        let dh_params = await!(addr.send(client::CallFunction::plain(mtproto::rpc::ReqDHParams {
             nonce, server_nonce, public_key_fingerprint, encrypted_data, p, q,
         })))??;
         (aes, dh_params)
@@ -97,7 +97,7 @@ pub fn kex<E>(addr: Addr<client::RpcClientActor>, pq_executor: E, expires_in: Op
         }.into_boxed();
         let encrypted_data = aes.ige_encrypt(&inner.boxed_serialized_bytes()?, true)?.into();
         let set_dh = mtproto::rpc::SetClientDHParams { nonce, server_nonce, encrypted_data };
-        await!(addr.send(client::SendMessage::plain(set_dh)))??
+        await!(addr.send(client::CallFunction::plain(set_dh)))??
     };
     let expected_new_nonce_hash1 = auth_key.new_nonce_hash(1, new_nonce)?;
     match dh_answer {
@@ -122,4 +122,14 @@ pub fn new_auth_key<E>(addr: Addr<client::RpcClientActor>, pq_executor: E, temp_
         perm_key: perm_key.clone(),
     }))??;
     Ok(perm_key)
+}}
+
+pub fn adopt_auth_key<E>(addr: Addr<client::RpcClientActor>, pq_executor: E, temp_key_duration: Duration, perm_key: AuthKey) -> impl Future<Item = (), Error = Error>
+    where E: future::Executor<Box<Future<Item = (), Error = ()> + Send>> + Clone
+{ async_block! {
+    let (temp_key, salt) = await!(kex(addr.clone(), pq_executor.clone(), Some(temp_key_duration)))?;
+    await!(addr.send(client::BindAuthKey {
+        temp_key, temp_key_duration, salt, perm_key,
+    }))??;
+    Ok(())
 }}

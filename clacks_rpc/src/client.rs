@@ -6,7 +6,7 @@ use clacks_mtproto::{AnyBoxedSerialize, BoxedDeserialize, ConstructorNumber, mtp
 use clacks_transport::{AppId, Session, TelegramCodec, session};
 use failure::Error;
 use futures::{self, Future, IntoFuture, Sink, Stream, future, stream};
-use futures::unsync::oneshot;
+use futures::sync::oneshot;
 use slog::Logger;
 use std::io;
 use std::collections::BTreeMap;
@@ -62,6 +62,11 @@ impl RpcClientActor {
             _ => (),
         }
     }
+
+    fn get_replier(&mut self, msg_id: i64) -> Result<(ConstructorNumber, Responder)> {
+        self.pending_rpcs.remove(&msg_id)
+            .ok_or_else(|| format_err!("no matching rpc for {}", msg_id))
+    }
 }
 
 impl Actor for RpcClientActor {
@@ -106,43 +111,36 @@ impl StreamHandler<Vec<u8>, io::Error> for RpcClientActor {
 
 }
 
-pub struct SendMessage<R> {
+pub struct SendMessage {
     builder: session::EitherMessageBuilder,
-    _dummy: PhantomData<fn() -> R>,
 }
 
-impl<R> SendMessage<R>
-    where R: BoxedDeserialize + AnyBoxedSerialize,
-{
+impl SendMessage {
     pub fn encrypted<M>(query: M) -> Self
-        where M: ::clacks_mtproto::Function<Reply = R>,
+        where M: AnyBoxedSerialize,
     {
         SendMessage {
             builder: session::EitherMessageBuilder::encrypted(query),
-            _dummy: PhantomData,
         }
     }
 
-    pub(crate) fn plain<M>(query: M) -> Self
-        where M: ::clacks_mtproto::Function<Reply = R>,
+    pub fn plain<M>(query: M) -> Self
+        where M: AnyBoxedSerialize,
     {
         SendMessage {
             builder: session::EitherMessageBuilder::plain(query),
-            _dummy: PhantomData,
         }
     }
 }
 
-impl<R: 'static> Message for SendMessage<R> {
-    type Result = Result<R>;
+impl Message for SendMessage {
+    type Result = Result<mtproto::TLObject>;
 }
 
-impl<R> Handler<SendMessage<R>> for RpcClientActor
-    where R: BoxedDeserialize + AnyBoxedSerialize,
-{
-    type Result = ResponseFuture<R, Error>;
+impl Handler<SendMessage> for RpcClientActor {
+    type Result = ResponseFuture<mtproto::TLObject, Error>;
 
-    fn handle(&mut self, message: SendMessage<R>, ctx: &mut Self::Context) -> Self::Result {
+    fn handle(&mut self, message: SendMessage, ctx: &mut Self::Context) -> Self::Result {
         use std::collections::btree_map::Entry::*;
         let tg_tx = match self.tg_tx {
             Some(ref mut c) => c,
@@ -166,6 +164,49 @@ impl<R> Handler<SendMessage<R>> for RpcClientActor
                 .into_future()
                 .and_then(move |()| rx.map_err(Into::into))
                 .and_then(|r| r)
+        })
+    }
+}
+
+pub struct CallFunction<R> {
+    inner: SendMessage,
+    _dummy: PhantomData<fn() -> R>,
+}
+
+impl<R> CallFunction<R>
+    where R: BoxedDeserialize + AnyBoxedSerialize,
+{
+    pub fn encrypted<M>(query: M) -> Self
+        where M: ::clacks_mtproto::Function<Reply = R>,
+    {
+        CallFunction {
+            inner: SendMessage::encrypted(query),
+            _dummy: PhantomData,
+        }
+    }
+
+    pub fn plain<M>(query: M) -> Self
+        where M: ::clacks_mtproto::Function<Reply = R>,
+    {
+        CallFunction {
+            inner: SendMessage::plain(query),
+            _dummy: PhantomData,
+        }
+    }
+}
+
+impl<R: 'static> Message for CallFunction<R> {
+    type Result = Result<R>;
+}
+
+impl<R> Handler<CallFunction<R>> for RpcClientActor
+    where R: BoxedDeserialize + AnyBoxedSerialize,
+{
+    type Result = ResponseFuture<R, Error>;
+
+    fn handle(&mut self, message: CallFunction<R>, ctx: &mut Self::Context) -> Self::Result {
+        Box::new({
+            <RpcClientActor as Handler<SendMessage>>::handle(self, message.inner, ctx)
                 .and_then(|o| match o.downcast::<R>() {
                     Ok(r) => Ok(r),
                     Err(e) => {
@@ -197,8 +238,8 @@ impl Handler<BindAuthKey> for RpcClientActor {
         self.session.add_server_salts(::std::iter::once(salt));
         let addr = ctx.address();
         let bound = self.session.bind_auth_key(perm_key, temp_key_duration)
-            .map(|message| addr.send(SendMessage::<mtproto::Bool> {
-                builder: message.lift(),
+            .map(|message| addr.send(CallFunction::<mtproto::Bool> {
+                inner: SendMessage { builder: message.lift() },
                 _dummy: PhantomData,
             }));
         Box::new({
@@ -270,17 +311,24 @@ scan_type! {
 
     (this, ctx, rpc: mtproto::manual::RpcResult) {
         let mtproto::manual::RpcResult::RpcResult(rpc) = rpc;
-        let (_, replier) = match this.pending_rpcs.remove(&rpc.req_msg_id) {
-            Some(t) => t,
-            None => {
-                return Err(format_err!("no matching rpc for {:?}", rpc));
-            }
-        };
+        let (_, replier) = this.get_replier(rpc.req_msg_id)?;
         let result = match rpc.result.downcast::<mtproto::RpcError>() {
             Ok(err) => Err(RpcError::UpstreamRpcError(err).into()),
             Err(obj) => Ok(obj),
         };
         let _ = replier.send(result);
+        Ok(())
+    }
+
+    (this, ctx, pong: mtproto::Pong) {
+        let (_, replier) = this.get_replier(*pong.msg_id())?;
+        let _ = replier.send(Ok(mtproto::TLObject::new(pong)));
+        Ok(())
+    }
+
+    (this, ctx, salts: mtproto::FutureSalts) {
+        let (_, replier) = this.get_replier(*salts.req_msg_id())?;
+        let _ = replier.send(Ok(mtproto::TLObject::new(salts)));
         Ok(())
     }
 }

@@ -101,6 +101,7 @@ pub mod parser {
         pub output: Ty,
         pub original_variant: String,
         pub original_output: String,
+        pub is_function: bool,
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -216,6 +217,7 @@ pub mod parser {
                 variant: Type::Named(variant.0),
                 original_output: output.1,
                 output: output.0,
+                is_function: false,
             })
             .name("constructor")
     }
@@ -325,6 +327,7 @@ pub mod parser {
 use parser::{Constructor, Delimiter, Field, Item, Matched, NameChunks, Type};
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::borrow::Cow;
 use std::mem;
 
 fn fail_hard() -> Tokens {
@@ -396,12 +399,15 @@ impl Namespace {
         quote!(#( #items )*)
     }
 
-    fn populate_all_constructors<'this>(&'this self, to_populate: &mut Vec<&'this Constructors<TypeIR, FieldIR>>) {
+    fn populate_all_constructors<'this>(&'this self, to_populate: &mut Vec<&'this Constructor<TypeIR, FieldIR>>) {
         use self::NamespaceItem::*;
         for item in self.0.values() {
             match *item {
                 AsEnum(ref cs) => {
-                    to_populate.push(cs);
+                    to_populate.extend(cs.0.iter().map(|cm| &cm.0));
+                },
+                AsFunction(ref c) => {
+                    to_populate.push(&c.0);
                 },
                 AnotherNamespace(ref ns) => {
                     ns.populate_all_constructors(to_populate);
@@ -453,7 +459,10 @@ impl AllConstructors {
                                 .or_insert_with(Default::default)
                                 .0.push(Matched(c, m));
                         },
-                        Delimiter::Functions => functions.push(Matched(c, m)),
+                        Delimiter::Functions => {
+                            c.is_function = true;
+                            functions.push(Matched(c, m));
+                        },
                     }
                 },
                 Item::Layer(i) => ret.layer = i,
@@ -486,22 +495,34 @@ impl AllConstructors {
         ret
     }
 
-    fn as_dynamic_deserializers(&self) -> Tokens {
+    fn as_lazy_statics(&self) -> Tokens {
         let mut all_constructors = Default::default();
         self.items.populate_all_constructors(&mut all_constructors);
-        let dynamic_deserializer = all_constructors.iter()
-            .map(|cs| cs.as_dynamic_deserializer());
+        let numeric_dynamic_deserializer = all_constructors.iter()
+            .map(|c| c.as_numeric_dynamic_deserializer());
+        let named_dynamic_deserializer = all_constructors.iter()
+            .map(|c| c.as_named_dynamic_deserializer());
 
         quote! {
 
-            lazy_static! {
-                pub static ref DYNAMIC_DESERIALIZERS:
+            pub mod dynamic {
+                lazy_static! {
+                    pub static ref BY_NUMBER:
                     ::std::collections::BTreeMap<::ConstructorNumber, ::DynamicDeserializer> =
-                {
-                    let mut ret = ::std::collections::BTreeMap::new();
-                    #( #dynamic_deserializer )*
-                    ret
-                };
+                    {
+                        let mut ret = ::std::collections::BTreeMap::new();
+                        #( #numeric_dynamic_deserializer )*
+                        ret
+                    };
+
+                    pub static ref BY_NAME:
+                    ::std::collections::BTreeMap<&'static str, ::DynamicDeserializer> =
+                    {
+                        let mut ret = ::std::collections::BTreeMap::new();
+                        #( #named_dynamic_deserializer )*
+                        ret
+                    };
+                }
             }
 
         }
@@ -509,7 +530,7 @@ impl AllConstructors {
 
     fn as_tokens(&self) -> Tokens {
         let ns_tokens = self.items.as_tokens();
-        let dynamic_deserializers = self.as_dynamic_deserializers();
+        let dynamic_deserializers = self.as_lazy_statics();
         quote! {
 
             #ns_tokens
@@ -812,10 +833,11 @@ impl TypeIR {
         self
     }
 
-    fn io_turbofish(&self) -> Tokens {
+    fn io_turbofish(&self, with_tlobject: bool) -> Tokens {
         use self::WireKind::*;
         let mut ty = match self.wire_kind {
             Flags => quote!(::mtproto::Flags),
+            TypeParameter(_) if with_tlobject => quote!(::mtproto::TLObject),
             _ => self.non_field_type(),
         };
         if self.needs_box {
@@ -824,17 +846,17 @@ impl TypeIR {
         quote!(::<#ty>)
     }
 
-    fn assemble_method(&self, method: Tokens) -> Tokens {
-        let turbofish = self.io_turbofish();
+    fn assemble_method(&self, with_tlobject: bool, method: Tokens) -> Tokens {
+        let turbofish = self.io_turbofish(with_tlobject);
         quote!(#method #turbofish)
     }
 
     fn as_read_method(&self) -> Tokens {
-        self.assemble_method(self.wire_kind.as_read_method())
+        self.assemble_method(true, self.wire_kind.as_read_method())
     }
 
     fn as_write_method(&self) -> Option<Tokens> {
-        self.wire_kind.as_write_method().map(|m| self.assemble_method(m))
+        self.wire_kind.as_write_method().map(|m| self.assemble_method(false, m))
     }
 
     fn non_field_type(&self) -> Tokens {
@@ -1035,6 +1057,7 @@ impl Constructor<Type, Field> {
             tl_id: self.tl_id,
             original_variant: self.original_variant,
             original_output: self.original_output,
+            is_function: self.is_function,
         }
     }
 
@@ -1101,33 +1124,30 @@ impl Constructor<TypeIR, FieldIR> {
         }
     }
 
-    fn generics(&self) -> Tokens {
+    fn generics<F>(&self, mut param_cb: F) -> Tokens
+        where F: FnMut(syn::Ident) -> Tokens,
+    {
         if self.type_parameters.is_empty() {
             return quote!();
         }
-        let tys = self.type_parameters.iter().map(FieldIR::name);
-        quote! { <#(#tys),*> }
+        let bounds = self.type_parameters.iter().map(move |p| param_cb(p.name()));
+        quote! { <#(#bounds),*> }
+    }
+
+    fn impl_generics(&self) -> Tokens {
+        self.generics(|ty| quote!(#ty))
     }
 
     fn rpc_generics(&self) -> Tokens {
-        self.type_generics(&quote!(::Function))
+        self.generics(|ty| quote!(#ty: ::Function))
     }
 
-    fn type_generics(&self, trait_: &Tokens) -> Tokens {
-        if self.type_parameters.is_empty() {
-            return quote!();
-        }
-        let tys = self.type_parameters.iter().map(FieldIR::name);
-        let traits = std::iter::repeat(trait_);
-        quote! { <#(#tys: #traits),*> }
+    fn deserialize_tlobject_generics(&self) -> Tokens {
+        self.generics(|_| quote!(::mtproto::TLObject))
     }
 
     fn serialize_generics(&self) -> Tokens {
-        if self.type_parameters.is_empty() {
-            return quote!();
-        }
-        let tys = self.type_parameters.iter().map(FieldIR::name);
-        quote! { <#(#tys: ::AnyBoxedSerialize),*> }
+        self.generics(|ty| quote!(#ty: ::AnyBoxedSerialize))
     }
 
     fn as_struct_determine_flags(&self, field_prefix: Tokens) -> Option<Tokens> {
@@ -1163,12 +1183,12 @@ impl Constructor<TypeIR, FieldIR> {
 
     fn as_struct_base(&self, name: &syn::Ident, matched: &str) -> Tokens {
         let doc = self.as_struct_doc(matched);
-        let generics = self.generics();
+        let impl_generics = self.impl_generics();
         let fields = self.fields_tokens(quote! {pub}, quote! {;});
         quote! {
-            #[derive(Debug, Clone, Serialize)]
+            #[derive(Debug, Clone, Serialize, Deserialize)]
             #[doc = #doc]
-            pub struct #name #generics #fields
+            pub struct #name #impl_generics #fields
         }
     }
 
@@ -1218,7 +1238,7 @@ impl Constructor<TypeIR, FieldIR> {
     }
 
     fn as_into_boxed(&self, name: &syn::Ident) -> Option<Tokens> {
-        if self.tl_id().is_none() {
+        if self.tl_id().is_none() || self.is_function {
             return None;
         }
         let constructor = self.output.unboxed();
@@ -1335,36 +1355,38 @@ impl Constructor<TypeIR, FieldIR> {
         let name = self.variant_name();
         let tl_id = self.tl_id().unwrap();
         let rpc_generics = self.rpc_generics();
+        let deserialize_generics = self.deserialize_tlobject_generics();
         let serialize_generics = self.serialize_generics();
-        let generics = self.generics();
-        let struct_block = self.as_struct_base(&name, matched);
+        let impl_generics = self.impl_generics();
         let mut output_ty = self.output.boxed();
         if self.output.is_type_parameter() {
             output_ty = quote! {#output_ty::Reply};
         }
-        let serialize_destructure = self.as_variant_ref_destructure(&name)
-            .map(|d| quote! { let &#d = self; })
-            .unwrap_or_else(|| quote!());
-        let serialize_stmts = self.as_variant_serialize();
-        let type_impl = self.as_type_impl(
-            &name,
-            quote!(#serialize_destructure #serialize_stmts Ok(())),
-            None);
+        let base = self.as_type_struct_base(self.variant_name(), matched);
 
         quote! {
-            #struct_block
+            #base
 
-            impl #serialize_generics ::BoxedSerialize for #name #generics {
+            impl ::BoxedDeserialize for #name #deserialize_generics {
+                fn possible_constructors() -> Vec<::ConstructorNumber> { vec![#tl_id] }
+                fn deserialize_boxed(id: ::ConstructorNumber, de: &mut ::Deserializer) -> ::Result<Self> {
+                    if id == #tl_id {
+                        de.read_bare()
+                    } else {
+                        _invalid_id!(id)
+                    }
+                }
+            }
+
+            impl #serialize_generics ::BoxedSerialize for #name #impl_generics {
                 fn serialize_boxed<'this>(&'this self) -> (::ConstructorNumber, &'this ::BareSerialize) {
                     (#tl_id, self)
                 }
             }
 
-            impl #rpc_generics ::Function for #name #generics {
+            impl #rpc_generics ::Function for #name #impl_generics {
                 type Reply = #output_ty;
             }
-
-            #type_impl
         }
     }
 
@@ -1405,12 +1427,12 @@ impl Constructor<TypeIR, FieldIR> {
 
     fn as_type_impl(&self, name: &syn::Ident, serialize: Tokens, deserialize: Option<Tokens>) -> Tokens {
         let serialize_generics = self.serialize_generics();
-        let generics = self.generics();
+        let impl_generics = self.impl_generics();
 
         let deserialize = deserialize.map(|body| {
-            let bare_deserialize_generics = self.type_generics(&quote!(::BareDeserialize));
+            let deserialize_generics = self.deserialize_tlobject_generics();
             quote! {
-                impl #bare_deserialize_generics ::BareDeserialize for #name #generics {
+                impl ::BareDeserialize for #name #deserialize_generics {
                     fn deserialize_bare(_de: &mut ::Deserializer) -> ::Result<Self> {
                         #body
                     }
@@ -1419,7 +1441,7 @@ impl Constructor<TypeIR, FieldIR> {
         }).unwrap_or_else(|| quote!());
 
         quote! {
-            impl #serialize_generics ::BareSerialize for #name #generics {
+            impl #serialize_generics ::BareSerialize for #name #impl_generics {
                 fn serialize_bare(&self, _ser: &mut ::Serializer) -> ::Result<()> {
                     #serialize
                 }
@@ -1427,6 +1449,43 @@ impl Constructor<TypeIR, FieldIR> {
 
             #deserialize
         }
+    }
+
+    fn as_dynamic_deserializer<KF>(&self, key_func: KF) -> Tokens
+        where KF: FnOnce(&Tokens, &str) -> Tokens,
+    {
+        let tl_id = match self.tl_id() {
+            Some(i) => i,
+            None => return quote!(),
+        };
+        let type_name = if self.is_function {
+            Cow::Owned(format!("rpc.{}", self.original_variant))
+        } else {
+            Cow::Borrowed(&self.original_variant)
+        };
+        let key = key_func(&tl_id, &type_name);
+        let mut ty = if &self.original_variant == "manual.gzip_packed" {
+            quote!(::mtproto::TransparentGunzip)
+        } else if self.is_function {
+            self.variant.unboxed()
+        } else {
+            self.output.unboxed()
+        };
+        if !self.type_parameters.is_empty() {
+            let generics = self.type_parameters.iter().map(|_| quote!(::mtproto::TLObject));
+            ty = quote!(#ty<#(#generics),*>);
+        }
+        quote! {
+            ret.insert(#key, ::DynamicDeserializer::from::<#ty>(#tl_id, #type_name));
+        }
+    }
+
+    fn as_numeric_dynamic_deserializer(&self) -> Tokens {
+        self.as_dynamic_deserializer(|id, _| id.clone())
+    }
+
+    fn as_named_dynamic_deserializer(&self) -> Tokens {
+        self.as_dynamic_deserializer(|_, type_name| quote!(#type_name))
     }
 }
 
@@ -1644,21 +1703,6 @@ impl Constructors<TypeIR, FieldIR> {
         quote!(#( #tl_ids, )*)
     }
 
-    fn as_dynamic_deserializer(&self) -> Tokens {
-        let constructors = self.constructors_and_tl_ids()
-            .map(|(tl_id, c)| {
-                let ty = if &c.original_variant == "manual.gzip_packed" {
-                    quote!(::mtproto::TransparentGunzip)
-                } else {
-                    c.output.unboxed()
-                };
-                quote!(ret.insert(#tl_id, <#ty as ::BoxedDeserializeDynamic>::boxed_deserialize_to_box as ::DynamicDeserializer))
-            });
-        quote! {
-            #( #constructors; )*
-        }
-    }
-
     fn as_deserialize_match(&self, enum_name: &syn::Ident) -> Tokens {
         let constructors = self.constructors_and_tl_ids()
             .map(|(tl_id, c)| {
@@ -1703,7 +1747,7 @@ impl Constructors<TypeIR, FieldIR> {
         let option_type_impl = self.as_option_type_impl();
 
         quote! {
-            #[derive(Debug, Clone, Serialize)]
+            #[derive(Debug, Clone, Serialize, Deserialize)]
             #[doc = #doc]
             pub enum #name {
                 #( #variants , )*
