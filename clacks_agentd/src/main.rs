@@ -2,6 +2,7 @@
 #![feature(proc_macro, proc_macro_non_items, generators)]
 
 #[macro_use] extern crate delegate;
+#[macro_use] extern crate failure;
 #[macro_use] extern crate jsonrpc_macros;
 #[macro_use] extern crate serde_derive;
 #[macro_use] extern crate slog;
@@ -13,7 +14,6 @@ extern crate clacks_crypto;
 extern crate clacks_mtproto;
 extern crate clacks_rpc;
 extern crate clacks_transport;
-extern crate failure;
 extern crate futures_await as futures;
 extern crate futures_cpupool;
 extern crate jsonrpc_core;
@@ -21,7 +21,6 @@ extern crate rand;
 extern crate keyring;
 extern crate serde;
 extern crate serde_json;
-extern crate sexpr;
 extern crate slog_async;
 extern crate slog_envlogger;
 extern crate slog_scope;
@@ -32,14 +31,10 @@ extern crate tokio_io;
 extern crate tokio_uds;
 
 use actix::prelude::*;
-use byteorder::{BigEndian, ByteOrder, LittleEndian};
-use clacks_crypto::csrng_gen;
 use clacks_mtproto::{BoxedDeserialize, BoxedSerialize, IntoBoxed, mtproto};
 use futures::{Future, Sink, Stream, future};
 use futures::prelude::*;
-use rand::Rng;
 use std::io;
-use tokio_io::{AsyncRead, AsyncWrite};
 
 mod real_shutdown;
 use real_shutdown::RealShutdown;
@@ -47,81 +42,7 @@ use real_shutdown::RealShutdown;
 mod agent_connection;
 mod jsonrpc_handler;
 mod secrets;
-
-
-struct ElispFormatter(sexpr::ser::CompactFormatter);
-
-macro_rules! enquote_integer {
-    ($ty:ident, $meth:ident) => {
-
-        fn $meth<W: ?Sized>(&mut self, writer: &mut W, value: $ty) -> io::Result<()>
-            where W: io::Write,
-        {
-            self.enquote(writer, |this, w| (this.0).$meth(w, value))
-        }
-
-    };
-}
-
-impl sexpr::ser::Formatter for ElispFormatter {
-    fn write_null<W: ?Sized>(&mut self, writer: &mut W) -> io::Result<()>
-        where W: io::Write,
-    {
-        writer.write_all(b"nil")
-    }
-
-    fn write_bool<W: ?Sized>(&mut self, writer: &mut W, value: bool) -> io::Result<()>
-        where W: io::Write,
-    {
-        writer.write_all(if value {b"t"} else {b"nil"})
-    }
-
-    enquote_integer!(u32, write_u32);
-    enquote_integer!(i32, write_i32);
-    enquote_integer!(u64, write_u64);
-    enquote_integer!(i64, write_i64);
-
-    fn begin_object_key<W: ?Sized>(&mut self, writer: &mut W, first: bool) -> io::Result<()>
-        where W: io::Write,
-    {
-        if first {
-            writer.write_all(b"(")
-        } else {
-            writer.write_all(b" (")
-        }
-    }
-
-    fn begin_object_value<W: ?Sized>(&mut self, writer: &mut W) -> io::Result<()>
-        where W: io::Write,
-    {
-        writer.write_all(b". ")
-    }
-
-    fn end_object_value<W: ?Sized>(&mut self, writer: &mut W) -> io::Result<()>
-        where W: io::Write,
-    {
-        writer.write_all(b")")
-    }
-}
-
-impl ElispFormatter {
-    fn to_string<S>(obj: &S) -> io::Result<String>
-        where S: serde::Serialize,
-    {
-        let mut ret: Vec<u8> = vec![];
-        obj.serialize(&mut sexpr::Serializer::with_formatter(&mut ret, ElispFormatter(sexpr::ser::CompactFormatter)))?;
-        Ok(String::from_utf8(ret).unwrap())
-    }
-
-    fn enquote<W: ?Sized, F>(&mut self, writer: &mut W, func: F) -> io::Result<()>
-        where W: io::Write, F: FnOnce(&mut Self, &mut W) -> io::Result<()>,
-    {
-        writer.write_all(b"\"")?;
-        func(self, writer)?;
-        writer.write_all(b"\"")?;
-        Ok(())
-    }
-}
+mod tg_manager;
 
 
 struct Delegate;
@@ -131,7 +52,6 @@ impl Handler<clacks_rpc::client::Unhandled> for Delegate {
 
     fn handle(&mut self, unhandled: clacks_rpc::client::Unhandled, _: &mut Self::Context) {
         println!("unhandled {:?}", unhandled.0);
-        println!("---sexpr---\n{}\n", ElispFormatter::to_string(&unhandled.0).expect("not serialized"));
         println!("---json---\n{}\n---", serde_json::to_string_pretty(&unhandled.0).expect("not serialized"));
     }
 }
@@ -179,7 +99,6 @@ fn kex(log: slog::Logger) -> impl Future<Item = (), Error = failure::Error> { as
     };
     let answer = await!(client.send(clacks_rpc::client::SendMessage::encrypted(init)))??;
     println!("answer: {:#?}", answer);
-    println!("---sexpr---\n{}\n", ElispFormatter::to_string(&answer).expect("not serialized"));
     println!("---json---\n{}\n---", serde_json::to_string_pretty(&answer).expect("not serialized"));
     let answer = await!(client.send(clacks_rpc::client::SendMessage::encrypted(send_code)))??;
     Ok(())
@@ -213,9 +132,13 @@ fn main() {
     let _scoped = slog_scope::set_global_logger(log.new(o!("subsystem" => "implicit logger")));
 
     System::run(move || {
+        let tg_manager = {
+            let log = log.new(o!("subsystem" => "tg manager"));
+            tg_manager::TelegramManagerActor::new(log).start()
+        };
         let jsonrpc = {
             let log = log.new(o!("subsystem" => "jsonrpc handler"));
-            jsonrpc_handler::JsonRpcHandlerActor::new(log).start()
+            jsonrpc_handler::JsonRpcHandlerActor::new(log, tg_manager).start()
         };
         Arbiter::spawn({
             let log = log.clone();

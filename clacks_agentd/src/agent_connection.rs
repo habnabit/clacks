@@ -1,16 +1,9 @@
-use actix::{self, Actor, Addr, Arbiter, AsyncContext, Context, StreamHandler, System};
+//use actix::{self, Actor, Addr, Arbiter, AsyncContext, Context, StreamHandler, System};
 use actix::prelude::*;
-use chrono::{Duration, Utc};
-use clacks_crypto::symm::AuthKey;
-use clacks_mtproto::{AnyBoxedSerialize, BoxedDeserialize, ConstructorNumber, mtproto};
-use clacks_transport::{AppId, Session, TelegramCodec, session};
 use failure::Error;
-use futures::{self, Future, IntoFuture, Sink, Stream, future, stream};
-use futures::unsync::oneshot;
+use futures::{Future, IntoFuture};
 use slog::Logger;
 use std::io;
-use std::collections::BTreeMap;
-use std::marker::PhantomData;
 use tokio_codec::{FramedRead, LinesCodec};
 use tokio_io;
 
@@ -66,6 +59,7 @@ impl StreamHandler<String, io::Error> for AgentActor {
                 .and_then(|f| f)
                 .into_actor(self)
                 .then(|r, this, ctx| {
+                    println!("got: {:#?}", r);
                     match r {
                         Ok(Ok(Some(resp))) => {
                             if let Some(ref mut tx) = this.tx {

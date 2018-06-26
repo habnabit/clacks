@@ -1,19 +1,10 @@
-use actix::{self, Actor, Addr, Arbiter, AsyncContext, Context, StreamHandler, System};
 use actix::prelude::*;
-use chrono::{Duration, Utc};
-use clacks_crypto::symm::AuthKey;
-use clacks_mtproto::{AnyBoxedSerialize, BoxedDeserialize, ConstructorNumber, mtproto};
-use clacks_transport::{AppId, Session, TelegramCodec, session};
+use clacks_mtproto::mtproto;
 use failure::Error;
-use futures::{self, Future, IntoFuture, Sink, Stream, future, stream};
-use futures::unsync::oneshot;
-use jsonrpc_core::{self, FutureResult, Metadata, MetaIoHandler, Middleware, NoopMiddleware};
+use futures::{Future, IntoFuture};
+use jsonrpc_core::{self, MetaIoHandler, NoopMiddleware};
 use slog::Logger;
-use std::io;
-use std::collections::BTreeMap;
-use std::marker::PhantomData;
-use tokio_codec::{FramedRead, LinesCodec};
-use tokio_io;
+use std::sync::Mutex;
 
 
 pub struct JsonRpcHandlerActor {
@@ -21,10 +12,10 @@ pub struct JsonRpcHandlerActor {
 }
 
 impl JsonRpcHandlerActor {
-    pub fn new(log: Logger) -> Self {
+    pub fn new(log: Logger, tg_manager: Addr<::tg_manager::TelegramManagerActor>) -> Self {
 		use self::rpc_trait::Rpc;
 		let mut handler = MetaIoHandler::default();
-		handler.extend_with(RpcImpl.to_delegate());
+		handler.extend_with(RpcImpl::new(tg_manager).to_delegate());
 		JsonRpcHandlerActor {
 			handler,
 		}
@@ -53,45 +44,73 @@ impl Handler<HandleRequest> for JsonRpcHandlerActor {
     }
 }
 
-type JsonRpcResponseFuture<T> = Box<Future<Item = T, Error = jsonrpc_core::Error> + Send + Sync>;
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SendRawFailure;
+type JsonRpcResponseFuture<T> = Box<Future<Item = T, Error = jsonrpc_core::Error> + Send>;
 
 mod rpc_trait {
-	use jsonrpc_core::{Error, FutureResult, Result};
-	use actix::ResponseFuture;
-	use super::JsonRpcResponseFuture;
+	use clacks_mtproto::mtproto::TLObject;
+	use jsonrpc_core::Result;
+	use super::{JsonRpcResponseFuture, SendRawFailure};
 
 	build_rpc_trait! {
 		pub trait Rpc {
-			/// Get One type.
-			#[rpc(name = "getOne")]
-			fn one(&self) -> Result<u64>;
+			#[rpc(name = "connect")]
+			fn connect(&self, String) -> JsonRpcResponseFuture<()>;
 
-			/// Adds two numbers and returns a result
-			#[rpc(name = "setTwo")]
-			fn set_two(&self, String) -> Result<()>;
-
-			/// Performs asynchronous operation
-			#[rpc(name = "beFancy")]
-			fn call(&self, u64) -> JsonRpcResponseFuture<(u64, String)>;
+			#[rpc(name = "hazmat.send_raw")]
+			fn send_raw(&self, TLObject) -> JsonRpcResponseFuture<::std::result::Result<TLObject, SendRawFailure>>;
 		}
 	}
 }
 
-struct RpcImpl;
+struct InnerRpcImpl {
+	tg_manager: Addr<::tg_manager::TelegramManagerActor>,
+}
+
+struct RpcImpl {
+	inner: Mutex<InnerRpcImpl>,
+}
+
+impl RpcImpl {
+	fn new(tg_manager: Addr<::tg_manager::TelegramManagerActor>) -> Self {
+		RpcImpl {
+			inner: Mutex::new(InnerRpcImpl { tg_manager }),
+		}
+	}
+}
 
 impl rpc_trait::Rpc for RpcImpl {
-	fn one(&self) -> jsonrpc_core::Result<u64> {
-		Ok(100)
-	}
-
-	fn set_two(&self, x: String) -> jsonrpc_core::Result<()> {
-		println!("{}", x);
-		Ok(())
-	}
-
-	fn call(&self, num: u64) -> JsonRpcResponseFuture<(u64, String)> {
+	fn connect(&self, phone_number: String) -> JsonRpcResponseFuture<()> {
 		Box::new({
-			Ok((num + 999, "hello".into())).into_future()
+			self.inner.lock()
+				.map_err(|e| format_err!("failed to lock"))
+				.map(|i| i.tg_manager.send(::tg_manager::Connect { phone_number }))
+				.into_future()
+				.and_then(|f| f.map_err(|e| -> Error { e.into() }))
+				.map_err(|e: Error| {
+					println!("failed? {:?}", e);
+					jsonrpc_core::Error::internal_error()
+				})
+		})
+	}
+
+	fn send_raw(&self, req: mtproto::TLObject) -> JsonRpcResponseFuture<::std::result::Result<mtproto::TLObject, SendRawFailure>>
+	{
+		Box::new({
+			self.inner.lock()
+				.map_err(|e| format_err!("failed to lock"))
+				.map(|i| i.tg_manager.send(::clacks_rpc::client::SendMessage::encrypted(req)))
+				.into_future()
+				.and_then(|f| f.map_err(|e| -> Error { e.into() }))
+				.map(|r| r.map_err(|e| {
+					println!("failed? {:?}", e);
+					SendRawFailure
+				}))
+				.map_err(|e| {
+					println!("failed? {:?}", e);
+					jsonrpc_core::Error::internal_error()
+				})
 		})
 	}
 }
