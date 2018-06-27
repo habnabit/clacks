@@ -1,0 +1,14 @@
+[workspace]
+members = [
+	"core",
+	"http",
+	"ipc",
+	"macros",
+	"minihttp",
+	"pubsub",
+	"pubsub/more-examples",
+	"server-utils",
+	"tcp",
+	"test",
+	"ws",
+]
