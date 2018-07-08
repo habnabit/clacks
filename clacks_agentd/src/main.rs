@@ -7,6 +7,7 @@
 #[macro_use] extern crate serde_derive;
 #[macro_use] extern crate slog;
 extern crate actix;
+extern crate async_bus;
 extern crate byteorder;
 extern crate bytes;
 extern crate chrono;
@@ -17,6 +18,7 @@ extern crate clacks_transport;
 extern crate futures_await as futures;
 extern crate futures_cpupool;
 extern crate jsonrpc_core;
+extern crate jsonrpc_pubsub;
 extern crate rand;
 extern crate keyring;
 extern crate serde;

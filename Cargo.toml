@@ -1,7 +1,7 @@
 [workspace]
 members = [
     "actix",
-    "bus",
+    "async_bus",
     "clacks_agentd",
     "clacks_crypto",
     "clacks_mtproto",
