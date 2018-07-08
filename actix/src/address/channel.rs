@@ -1,6 +1,7 @@
 //! This is copy of [sync/mpsc/](https://github.com/alexcrichton/futures-rs)
-use std::sync::atomic::{AtomicUsize, AtomicBool};
+use std::hash::{Hash, Hasher};
 use std::sync::atomic::Ordering::{Relaxed, SeqCst};
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::Arc;
 use std::{thread, usize};
 
@@ -24,9 +25,13 @@ where
 {
     fn do_send(&self, msg: M) -> Result<(), SendError<M>>;
 
+    fn try_send(&self, msg: M) -> Result<(), SendError<M>>;
+
     fn send(&self, msg: M) -> Result<Receiver<M::Result>, SendError<M>>;
 
     fn boxed(&self) -> Box<Sender<M>>;
+
+    fn hash(&self) -> usize;
 }
 
 /// The transmission end of a channel which is used to send values.
@@ -54,6 +59,10 @@ trait AssertKinds: Send + Sync + Clone {}
 /// a stream of values being computed elsewhere. This is created by the
 /// `channel` method.
 pub struct AddressReceiver<A: Actor> {
+    inner: Arc<Inner<A>>,
+}
+
+pub struct AddressSenderProducer<A: Actor> {
     inner: Arc<Inner<A>>,
 }
 
@@ -437,11 +446,18 @@ where
     fn do_send(&self, msg: M) -> Result<(), SendError<M>> {
         self.do_send(msg)
     }
+    fn try_send(&self, msg: M) -> Result<(), SendError<M>> {
+        self.try_send(msg, true)
+    }
     fn send(&self, msg: M) -> Result<Receiver<M::Result>, SendError<M>> {
         self.send(msg)
     }
     fn boxed(&self) -> Box<Sender<M>> {
         Box::new(self.clone())
+    }
+
+    fn hash(&self) -> usize {
+        self.inner.as_ref() as *const _ as usize
     }
 }
 
@@ -485,6 +501,92 @@ impl<A: Actor> Drop for AddressSender<A> {
         // last sender, notify receiver task
         if prev == 1 {
             self.signal();
+        }
+    }
+}
+
+impl<A: Actor> PartialEq for AddressSender<A> {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+}
+
+impl<A: Actor> Eq for AddressSender<A> {}
+
+impl<A: Actor> Hash for AddressSender<A> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        (self.inner.as_ref() as *const Inner<A>).hash(state);
+    }
+}
+
+//
+//
+// ===== impl SenderProducer =====
+//
+//
+impl<A: Actor> AddressSenderProducer<A> {
+    pub fn connected(&self) -> bool {
+        self.inner.num_senders.load(SeqCst) != 0
+    }
+
+    /// Get channel capacity
+    pub fn capacity(&self) -> usize {
+        self.inner.buffer.load(Relaxed)
+    }
+
+    /// Set channel capacity
+    ///
+    /// This method wakes up all waiting senders if new capacity is greater
+    /// than current
+    pub fn set_capacity(&mut self, cap: usize) {
+        let buffer = self.inner.buffer.load(Relaxed);
+        self.inner.buffer.store(cap, Relaxed);
+
+        // wake up all
+        if cap > buffer {
+            loop {
+                match unsafe { self.inner.parked_queue.pop() } {
+                    PopResult::Data(task) => {
+                        task.lock().notify();
+                    }
+                    PopResult::Empty => {
+                        // Queue empty, no task to wake up.
+                        return;
+                    }
+                    PopResult::Inconsistent => {
+                        // Same as above
+                        thread::yield_now();
+                    }
+                }
+            }
+        }
+    }
+
+    /// Get sender side of the channel
+    pub fn sender(&self) -> AddressSender<A> {
+        // this code same as Sender::clone
+        let mut curr = self.inner.num_senders.load(SeqCst);
+
+        loop {
+            // If the maximum number of senders has been reached, then fail
+            if curr == self.inner.max_senders() {
+                panic!("cannot clone `Sender` -- too many outstanding senders");
+            }
+
+            let next = curr + 1;
+            let actual = self.inner.num_senders.compare_and_swap(curr, next, SeqCst);
+
+            // The ABA problem doesn't matter here. We only care that the
+            // number of senders never exceeds the maximum.
+            if actual == curr {
+                return AddressSender {
+                    inner: Arc::clone(&self.inner),
+                    sender_task: Arc::new(Mutex::new(SenderTask::new())),
+                    maybe_parked: Arc::new(AtomicBool::new(false)),
+                };
+            }
+
+            curr = actual;
         }
     }
 }
@@ -557,6 +659,13 @@ impl<A: Actor> AddressReceiver<A> {
             }
 
             curr = actual;
+        }
+    }
+
+    /// Create sender producer
+    pub fn sender_producer(&self) -> AddressSenderProducer<A> {
+        AddressSenderProducer {
+            inner: self.inner.clone(),
         }
     }
 

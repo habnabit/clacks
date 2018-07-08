@@ -44,6 +44,7 @@ extern crate bitflags;
 #[macro_use]
 extern crate futures;
 extern crate tokio;
+extern crate tokio_codec;
 extern crate tokio_executor;
 extern crate tokio_io;
 extern crate tokio_reactor;
@@ -68,7 +69,6 @@ mod contextimpl;
 mod contextitems;
 mod handler;
 mod stream;
-mod stream2;
 mod supervisor;
 mod system;
 
@@ -96,7 +96,6 @@ pub use handler::{
 };
 pub use registry::{ArbiterService, Registry, SystemRegistry, SystemService};
 pub use stream::StreamHandler;
-pub use stream2::StreamHandler2;
 pub use supervisor::Supervisor;
 pub use sync::{SyncArbiter, SyncContext};
 pub use system::{System, SystemRunner};
@@ -133,7 +132,6 @@ pub mod prelude {
     };
     pub use registry::{ArbiterService, SystemService};
     pub use stream::StreamHandler;
-    pub use stream2::StreamHandler2;
     pub use supervisor::Supervisor;
     pub use sync::{SyncArbiter, SyncContext};
     pub use system::System;
@@ -165,8 +163,9 @@ pub mod dev {
     pub use prelude::*;
 
     pub use address::{Envelope, RecipientRequest, Request, ToEnvelope};
-    pub use contextimpl::ContextImpl;
+    pub use contextimpl::{AsyncContextParts, ContextFut, ContextParts};
     pub use handler::{MessageResponse, ResponseChannel};
+    pub use mailbox::Mailbox;
     pub use registry::{Registry, SystemRegistry};
 }
 

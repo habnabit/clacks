@@ -3,13 +3,11 @@ use std::time::Duration;
 use futures::Stream;
 
 use address::Addr;
-use arbiter::Arbiter;
 use context::Context;
 use contextitems::{ActorDelayedMessageItem, ActorMessageItem, ActorMessageStreamItem};
 use fut::{ActorFuture, ActorStream};
 use handler::{Handler, Message};
 use stream::StreamHandler;
-use stream2::StreamHandler2;
 use utils::{IntervalFunc, TimerFunc};
 
 #[allow(unused_variables)]
@@ -112,10 +110,7 @@ pub trait Actor: Sized + 'static {
     where
         Self: Actor<Context = Context<Self>>,
     {
-        let ctx = Context::new(Some(self));
-        let addr = ctx.address();
-        ctx.run();
-        addr
+        Context::new().run(self)
     }
 
     /// Start new asynchronous actor, returns address of newly created actor.
@@ -154,11 +149,9 @@ pub trait Actor: Sized + 'static {
         Self: Actor<Context = Context<Self>>,
         F: FnOnce(&mut Context<Self>) -> Self + 'static,
     {
-        let ctx = Context::create(f);
-        let addr = ctx.address();
-
-        Arbiter::spawn(ctx);
-        addr
+        let mut ctx = Context::new();
+        let act = f(&mut ctx);
+        ctx.run(act)
     }
 }
 
@@ -199,12 +192,12 @@ pub enum Running {
 
 impl ActorState {
     /// Indicates if actor is alive
-    pub fn alive(&self) -> bool {
-        *self == ActorState::Started || *self == ActorState::Running
+    pub fn alive(self) -> bool {
+        self == ActorState::Started || self == ActorState::Running
     }
     /// Indicates if actor is stopped of stopping
-    pub fn stopping(&self) -> bool {
-        *self == ActorState::Stopping || *self == ActorState::Stopped
+    pub fn stopping(self) -> bool {
+        self == ActorState::Stopping || self == ActorState::Stopped
     }
 }
 
@@ -300,53 +293,6 @@ where
         A: StreamHandler<S::Item, S::Error>,
     {
         <A as StreamHandler<S::Item, S::Error>>::add_stream(fut, self)
-    }
-
-    /// This method register stream to an actor context and
-    /// allows to handle `Stream` in similar way as normal actor messages.
-    ///
-    /// ```rust
-    /// # #[macro_use] extern crate actix;
-    /// # extern crate futures;
-    /// # use std::io;
-    /// use actix::prelude::*;
-    /// use futures::stream::once;
-    ///
-    /// #[derive(Message)]
-    /// struct Ping;
-    ///
-    /// struct MyActor;
-    ///
-    /// impl StreamHandler2<Ping, io::Error> for MyActor {
-    ///     fn handle(&mut self, msg: io::Result<Option<Ping>>, ctx: &mut Context<MyActor>) {
-    ///         match msg {
-    ///             Ok(Some(_)) => println!("PING"),
-    ///             _ => println!("finished"),
-    ///         }
-    /// #       System::current().stop();
-    ///     }
-    /// }
-    ///
-    /// impl Actor for MyActor {
-    ///     type Context = Context<Self>;
-    ///
-    ///     fn started(&mut self, ctx: &mut Context<Self>) {
-    ///         // add stream
-    ///         ctx.add_stream2(once::<Ping, io::Error>(Ok(Ping)));
-    ///     }
-    /// }
-    /// # fn main() {
-    /// #    System::run(|| {
-    /// #        let addr = MyActor.start();
-    /// #    });
-    /// # }
-    /// ```
-    fn add_stream2<S>(&mut self, fut: S) -> SpawnHandle
-    where
-        S: Stream + 'static,
-        A: StreamHandler2<S::Item, S::Error>,
-    {
-        <A as StreamHandler2<S::Item, S::Error>>::add_stream(fut, self)
     }
 
     /// This method is similar to `add_stream` but it skips stream errors.

@@ -1,5 +1,18 @@
 # CHANGES
 
+## [0.7.0] (2018-07-05)
+
+### Changed
+
+* Context impl refactoring, fix potential UB
+
+### Added
+
+* Implemented `Eq`, `PartialEq`, and `Hash` for `actix::Addr`
+
+* Implemented `Eq`, `PartialEq`, and `Hash` for `actix::Recipient`
+
+
 ## [0.6.2] (2018-06-xx)
 
 ### Changed

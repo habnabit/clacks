@@ -1,4 +1,5 @@
 use std::fmt;
+use std::hash::{Hash, Hasher};
 
 pub(crate) mod channel;
 mod envelope;
@@ -11,7 +12,7 @@ use handler::{Handler, Message};
 pub use self::envelope::{Envelope, EnvelopeProxy, ToEnvelope};
 pub use self::message::{RecipientRequest, Request};
 
-pub(crate) use self::channel::AddressReceiver;
+pub(crate) use self::channel::{AddressReceiver, AddressSenderProducer};
 use self::channel::{AddressSender, Sender};
 
 pub enum SendError<T> {
@@ -91,6 +92,20 @@ impl<A: Actor> Addr<A> {
         let _ = self.tx.do_send(msg);
     }
 
+    /// Try send message
+    ///
+    /// This method fails if actor's mailbox is full or closed. This method
+    /// register current task in receivers queue.
+    pub fn try_send<M>(&self, msg: M) -> Result<(), SendError<M>>
+    where
+        M: Message + Send + 'static,
+        M::Result: Send,
+        A: Handler<M>,
+        A::Context: ToEnvelope<A, M>,
+    {
+        self.tx.try_send(msg, true)
+    }
+
     #[inline]
     /// Send asynchronous message and wait for response.
     ///
@@ -132,6 +147,20 @@ impl<A: Actor> Clone for Addr<A> {
     }
 }
 
+impl<A: Actor> PartialEq for Addr<A> {
+    fn eq(&self, other: &Self) -> bool {
+        self.tx == other.tx
+    }
+}
+
+impl<A: Actor> Eq for Addr<A> {}
+
+impl<A: Actor> Hash for Addr<A> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.tx.hash(state)
+    }
+}
+
 /// `Recipient` type allows to send one specific message to an actor.
 ///
 /// You can get recipient with `Addr<_, _>::recipient()` method.
@@ -161,6 +190,14 @@ where
         self.tx.do_send(msg)
     }
 
+    /// Try send message
+    ///
+    /// This method fails if actor's mailbox is full or closed. This method
+    /// register current task in receivers queue.
+    pub fn try_send(&self, msg: M) -> Result<(), SendError<M>> {
+        self.tx.try_send(msg)
+    }
+
     /// Send message and asynchronously wait for response.
     ///
     /// Communication channel to the actor is bounded. if returned `Request`
@@ -188,10 +225,37 @@ where
     }
 }
 
+impl<M> PartialEq for Recipient<M>
+where
+    M: Message + Send,
+    M::Result: Send,
+{
+    fn eq(&self, other: &Self) -> bool {
+        self.tx.hash() == other.tx.hash()
+    }
+}
+
+impl<M> Eq for Recipient<M>
+where
+    M: Message + Send,
+    M::Result: Send,
+{
+}
+
+impl<M> Hash for Recipient<M>
+where
+    M: Message + Send,
+    M::Result: Send,
+{
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.tx.hash().hash(state)
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use ::futures::Future;
-    use ::prelude::*;
+    use futures::Future;
+    use prelude::*;
 
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -214,7 +278,9 @@ mod tests {
     impl actix::Handler<SetCounter> for ActorWithSmallMailBox {
         type Result = <SetCounter as Message>::Result;
 
-        fn handle(&mut self, ping: SetCounter, _: &mut actix::Context<Self>) -> Self::Result {
+        fn handle(
+            &mut self, ping: SetCounter, _: &mut actix::Context<Self>,
+        ) -> Self::Result {
             self.0.store(ping.0, Ordering::Relaxed);
         }
     }
@@ -237,11 +303,14 @@ mod tests {
             assert!(send.rx_is_some());
             let send2 = addr.clone().send(SetCounter(2));
             assert!(!send2.rx_is_some());
-            let send = send.join(send2).map(|_| {
-                System::current().stop();
-            }).map_err(|_| {
-                panic!("Message over limit should be delivered, but it is not!");
-            });
+            let send = send
+                .join(send2)
+                .map(|_| {
+                    System::current().stop();
+                })
+                .map_err(|_| {
+                    panic!("Message over limit should be delivered, but it is not!");
+                });
             Arbiter::spawn(send);
         });
 
