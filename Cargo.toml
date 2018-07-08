@@ -1,12 +1,18 @@
 [workspace]
 members = [
     "actix",
+    "bus",
     "clacks_agentd",
     "clacks_crypto",
     "clacks_mtproto",
     "clacks_rpc",
     "clacks_tl_codegen",
     "clacks_transport",
+    "jsonrpc/core",
+    "jsonrpc/macros",
+    "jsonrpc/pubsub",
+    "jsonrpc/server-utils",
+    "jsonrpc/test",
     "keyring-rs",
     "rust-security-framework/security-framework-sys",
     "rust-security-framework/security-framework",
