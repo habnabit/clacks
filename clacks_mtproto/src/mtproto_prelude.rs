@@ -162,7 +162,7 @@ impl<'de> serde::Deserialize<'de> for TLObject {
     fn deserialize<D>(deserializer: D) -> ::std::result::Result<Self, D::Error>
         where D: serde::Deserializer<'de>,
     {
-        struct Constructor(DynamicDeserializer);
+        struct Constructor(&'static DynamicDeserializer);
         struct DynVisitor;
         struct Visitor;
 

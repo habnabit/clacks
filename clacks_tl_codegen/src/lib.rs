@@ -498,29 +498,33 @@ impl AllConstructors {
     fn as_lazy_statics(&self) -> Tokens {
         let mut all_constructors = Default::default();
         self.items.populate_all_constructors(&mut all_constructors);
-        let numeric_dynamic_deserializer = all_constructors.iter()
-            .map(|c| c.as_numeric_dynamic_deserializer());
-        let named_dynamic_deserializer = all_constructors.iter()
-            .map(|c| c.as_named_dynamic_deserializer());
+        let dynamic_deserializers = all_constructors.iter()
+            .map(|c| c.as_dynamic_deserializer()).take(100);
 
         quote! {
 
             pub mod dynamic {
+                fn make_deserializers() -> ::std::vec::Vec<::DynamicDeserializer> {
+                    vec![ #( #dynamic_deserializers ),* ]
+                }
+
                 lazy_static! {
+                    static ref ALL_DESERIALIZERS: ::std::vec::Vec<::DynamicDeserializer> = make_deserializers();
+
                     pub static ref BY_NUMBER:
-                    ::std::collections::BTreeMap<::ConstructorNumber, ::DynamicDeserializer> =
+                    ::std::collections::BTreeMap<::ConstructorNumber, &'static ::DynamicDeserializer> =
                     {
-                        let mut ret = ::std::collections::BTreeMap::new();
-                        #( #numeric_dynamic_deserializer )*
-                        ret
+                        ALL_DESERIALIZERS.iter()
+                            .map(|d| (d.id, d))
+                            .collect()
                     };
 
                     pub static ref BY_NAME:
-                    ::std::collections::BTreeMap<&'static str, ::DynamicDeserializer> =
+                    ::std::collections::BTreeMap<&'static str, &'static ::DynamicDeserializer> =
                     {
-                        let mut ret = ::std::collections::BTreeMap::new();
-                        #( #named_dynamic_deserializer )*
-                        ret
+                        ALL_DESERIALIZERS.iter()
+                            .map(|d| (d.type_name, d))
+                            .collect()
                     };
                 }
             }
@@ -1451,9 +1455,7 @@ impl Constructor<TypeIR, FieldIR> {
         }
     }
 
-    fn as_dynamic_deserializer<KF>(&self, key_func: KF) -> Tokens
-        where KF: FnOnce(&Tokens, &str) -> Tokens,
-    {
+    fn as_dynamic_deserializer(&self) -> Tokens {
         let tl_id = match self.tl_id() {
             Some(i) => i,
             None => return quote!(),
@@ -1463,7 +1465,6 @@ impl Constructor<TypeIR, FieldIR> {
         } else {
             Cow::Borrowed(&self.original_variant)
         };
-        let key = key_func(&tl_id, &type_name);
         let mut ty = if &self.original_variant == "manual.gzip_packed" {
             quote!(::mtproto::TransparentGunzip)
         } else if self.is_function {
@@ -1476,16 +1477,8 @@ impl Constructor<TypeIR, FieldIR> {
             ty = quote!(#ty<#(#generics),*>);
         }
         quote! {
-            ret.insert(#key, ::DynamicDeserializer::from::<#ty>(#tl_id, #type_name));
+            ::DynamicDeserializer::from::<#ty>(#tl_id, #type_name)
         }
-    }
-
-    fn as_numeric_dynamic_deserializer(&self) -> Tokens {
-        self.as_dynamic_deserializer(|id, _| id.clone())
-    }
-
-    fn as_named_dynamic_deserializer(&self) -> Tokens {
-        self.as_dynamic_deserializer(|_, type_name| quote!(#type_name))
     }
 }
 

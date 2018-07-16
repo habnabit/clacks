@@ -54,15 +54,18 @@ impl<'r> Deserializer<'r> {
         Ok(ConstructorNumber(self.read_u32::<LittleEndian>()?))
     }
 
+    #[inline(always)]
     pub fn read_bare<D: BareDeserialize>(&mut self) -> Result<D> {
         D::deserialize_bare(self)
     }
 
+    #[inline(always)]
     pub fn read_boxed<D: BoxedDeserialize>(&mut self) -> Result<D> {
         let constructor = self.read_constructor()?;
         D::deserialize_boxed(constructor, self)
     }
 
+    #[inline(always)]
     pub fn just_default<D: Default>(&self) -> Result<D> {
         Ok(Default::default())
     }
@@ -122,6 +125,7 @@ pub struct DynamicDeserializer {
 }
 
 impl DynamicDeserializer {
+    #[inline(always)]
     pub fn from<D: BoxedDeserializeDynamic>(id: ConstructorNumber, type_name: &'static str) -> Self {
         DynamicDeserializer {
             id, type_name,
@@ -145,10 +149,12 @@ impl<'w> Serializer<'w> {
         Ok(self.write_u32::<LittleEndian>(id.0)?)
     }
 
+    #[inline(always)]
     pub fn write_bare<S: ?Sized + BareSerialize>(&mut self, obj: &S) -> Result<()> {
         obj.serialize_bare(self)
     }
 
+    #[inline(always)]
     pub fn write_boxed<S: ?Sized + BoxedSerialize>(&mut self, obj: &S) -> Result<()> {
         let (constructor, bare) = obj.serialize_boxed();
         self.write_constructor(constructor)?;

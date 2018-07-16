@@ -7,6 +7,7 @@ const TL_DIR: &str = "tl";
 const OUTPUT_FILE: &str = "src/mtproto.rs";
 
 fn main_result() -> io::Result<()> {
+    println!("cargo:rerun-if-changed={}", TL_DIR);
     let mut files = fs::read_dir(TL_DIR)?
         .map(|r| r.map(|d| d.path()))
         .collect::<Result<Vec<path::PathBuf>, _>>()?;
